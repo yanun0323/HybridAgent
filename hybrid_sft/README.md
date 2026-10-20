@@ -142,7 +142,7 @@ it in the environment with torch/Transformers/PEFT before the real smoke test.
 Neither a passed smoke test nor declining regression loss demonstrates successful
 recursive latent generation. That requires a separate generation evaluation with
 natural versus forced exits counted separately. No optimizer resume, LoRA
-self-conditioning, new latent evaluation suite or speed claim is added here.
+self-conditioning or speed claim is added by this training path.
 
 ### Reproducible format pilot
 
@@ -232,3 +232,65 @@ Reports include both overall and per-group counts; raw outputs retain `group` an
 calculations. This remains a small synthetic arithmetic probe, not a broad
 capability or latent-reasoning benchmark. Keep the checkpoint fixed and do not use
 these results for further tuning or checkpoint selection.
+
+### Fixed latent-generation pilot
+
+`scripts/latent_experiment.py` reuses the ordinary text evaluator for the control
+and the production `HybridGenerationEngine` for real recursive vector inputs.
+Preparation excludes operand tuples from all original splits and the generalization
+probe. It creates 8 development questions and 16 reserved test questions. It does
+not create training data or launch training. Keep the reserved test unopened until
+training choices and the final checkpoint are fixed.
+
+```bash
+python scripts/latent_experiment.py prepare --directory /content/latent-pilot \
+  --pilot /content/format-pilot --generalization /content/format-generalization \
+  --calibration /content/qwen-link-smoke/link_calibration.json
+python scripts/latent_experiment.py evaluate --directory /content/latent-pilot \
+  --model /content/format-pilot/checkpoint --reference /content/format-pilot/checkpoint \
+  --mode text --output /content/latent-pilot/text-dev.jsonl
+python scripts/latent_experiment.py evaluate --directory /content/latent-pilot \
+  --model /content/format-pilot/checkpoint --reference /content/format-pilot/checkpoint \
+  --mode hybrid --output /content/latent-pilot/untrained-dev.jsonl
+python scripts/latent_experiment.py evaluate --directory /content/latent-pilot \
+  --model /content/qwen-link-smoke --reference /content/format-pilot/checkpoint \
+  --mode hybrid --output /content/latent-pilot/one-update-dev.jsonl
+```
+
+Run these sequentially without another model occupying the GPU. The one-update
+checkpoint is a plumbing diagnostic, not a trained-reasoning result. A future
+trained checkpoint can use the same evaluator without changing data or limits.
+`--split latent-test` explicitly selects the reserved split; the default is dev.
+
+All conditions use the existing format instruction unchanged, including its
+text-inside-latent wording, so this probe measures that prompt rather than a newly
+optimized vector prompt. Hybrid conditions verify that LoRA/anchor tensors,
+base-reference metadata and tokenizer match the fixed format reference. Both use
+FP32 HybridLink and the **same** scale from the training-only calibration manifest,
+overriding the checkpoint scale in memory only. This avoids comparing an unscaled
+random link against a scaled updated one. Scale is magnitude calibration, not link
+training. Original checkpoints are never modified.
+
+Generation is greedy, single-request, with tools disabled, a total budget of 256
+text/vector steps and at most 64 vector steps per span. Minimum vector steps is
+zero: the evaluator never forces the model to stay in latent mode. Entry is not
+forced. Existing engine structural token masks remain enabled and differ from
+ordinary text decoding; only the two hybrid conditions share exactly the same
+engine constraints. This is not an unrestricted-generation or speed comparison.
+
+Raw outputs, scored text and engine counters are saved per question. Only terminal
+EOS is removed from structural scoring; an opening think prefix supplied by the
+chat template is restored. Real vector spans appear as `<latent></latent>` because
+vectors are not decoded as text. Strict success requires the right boxed answer,
+one well-formed span with actual vector steps, an anchor exit, no forced exits or
+tools, and EOS termination. Empty immediate exits, no entry, budget truncation and
+forced exits never count as success, even with a correct final answer. Counts for
+answer correctness, structure, vector use, exits and termination are reported
+separately. Correct answers still do not establish that latent computation was
+necessary; the model can perform work in visible text before or after the span.
+
+Tests cover disjoint reproducible splits, rejection of non-training calibration,
+and scoring edge cases. A scripted-output test drives the real engine to verify
+vector feeds, natural/forced exits, budget stops and intact answer digits; it is
+an engine test, not evidence of learned reasoning. Large-model runs remain a
+separate target-GPU check.
