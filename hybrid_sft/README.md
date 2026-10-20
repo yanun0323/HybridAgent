@@ -351,6 +351,34 @@ It compares sequential execution, not full-sequence training execution; further
 segmentation comparisons may be needed if the all-reference control fails. No
 training, checkpoint modification, retuning, or change to evaluation rules occurs.
 
+To compare the original 64-step link with **10% of the saved joint update** on
+these same two questions, use paired mode after the fixed-fraction probe:
+
+```bash
+python -u scripts/latent_diagnostic.py --directory /content/latent-pilot \
+  --model /content/qwen-link-64 --reference /content/format-pilot/checkpoint \
+  --joint-run /content/qwen-link-joint-8 \
+  --step-size-run /content/qwen-link-step-size \
+  --output /content/latent-pilot/diagnostic-joint-10pct.jsonl
+```
+
+This loads the backbone once, runs all four substitution conditions with the
+original link, then repeats with FP32 `before + 0.1 * (after - before)` in memory.
+Every condition starts with a fresh cache. Fractions are fixed at `0` and `0.1`;
+there is no training, fraction search, checkpoint selection, or weight export.
+The source/updated link and joint-run hashes are checked against the completed
+step-size probe; tokenizer, LoRA/anchor tensors and scales must also match.
+
+Each result includes `fraction`. JSONL retains every step; the summary includes
+mismatch positions, exit rank/probability/argmax and forced-exit continuation.
+Teacher-input predictions and continuation must match exactly between fractions,
+otherwise the script stops. Link-vector cosine/RMS may differ even in teacher
+conditions because the link is still measured but not fed. The source link hash
+in the summary names the original artifact; `paired_update` records both endpoint
+hashes and the fixed interpolation rule's fractions. This remains a known-prefix,
+known-length, forced-exit diagnostic, not autonomous generation. Its sequential
+cached execution differs from the full-prefix next-token CE probe.
+
 For a direction-versus-magnitude diagnostic, use a new output file and
 `--suite direction-size` on the same checkpoint and two development questions:
 

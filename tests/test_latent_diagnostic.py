@@ -32,6 +32,66 @@ class DiagnosticPlanTests(unittest.TestCase):
             diagnostic.replacement_count("unknown", 10)
 
 
+class PairedDiagnosticTests(unittest.TestCase):
+    def test_teacher_replay_ignores_link_metrics_but_rejects_behavior_changes(self):
+        import copy
+        before = {"reference_latent_tokens": 1, "replaced_tokens": 0,
+                  "continuation_after_forced_exit": "answer", "continuation_end_reason": "eos",
+                  "expected_text_continuation": "answer",
+                  "steps": [{"step": 0, "target_id": 5, "predicted_id": 5,
+                             "target_probability": .9, "exit_probability": .01,
+                             "exit_rank": 3, "exit_argmax": False, "cosine": .5}]}
+        after = copy.deepcopy(before)
+        after["steps"][0]["cosine"] = .8
+        diagnostic.check_teacher_replay(before, after)
+        for key in ("predicted_id", "target_probability", "exit_probability", "exit_rank", "exit_argmax"):
+            bad = copy.deepcopy(after)
+            bad["steps"][0][key] = 99
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, "teacher control changed"):
+                diagnostic.check_teacher_replay(before, bad)
+        for key in ("continuation_after_forced_exit", "continuation_end_reason"):
+            with self.assertRaises(RuntimeError):
+                diagnostic.check_teacher_replay(before, {**after, key: "changed"})
+        with self.assertRaisesRegex(RuntimeError, "step count"):
+            diagnostic.check_teacher_replay(before, {**after, "steps": []})
+
+    def test_pair_provenance_binds_exact_saved_update_and_scale(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, joint, step = root / "source", root / "joint", root / "step"
+            def save(path, obj):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(obj))
+            save(source / "adapter.pt", "source")
+            save(joint / "checkpoint/adapter.pt", "updated")
+            save(source / "lora/adapter_model.safetensors", "lora")
+            config = {"output_scale": .012}
+            for directory in (source, joint / "checkpoint"):
+                save(directory / "hybridlink_config.json", config)
+            run = {"source_link_sha256": diagnostic.sha256(source / "adapter.pt"),
+                   "source_lora_sha256": diagnostic.sha256(source / "lora/adapter_model.safetensors"),
+                   "calibration": config, "data_sha256": "data", "update_ids": ["a"], "observation_ids": ["b"]}
+            save(joint / "run.json", run)
+            save(joint / "summary.json", {})
+            prior = {"source_link_sha256": run["source_link_sha256"],
+                     "updated_link_sha256": diagnostic.sha256(joint / "checkpoint/adapter.pt"),
+                     "joint_run_sha256": diagnostic.sha256(joint / "run.json"),
+                     "joint_summary_sha256": diagnostic.sha256(joint / "summary.json"),
+                     "fractions_in_execution_order": [0., 1., .01, .1], "scale": .012,
+                     "data_sha256": "data", "update_ids": ["a"], "observation_ids": ["b"]}
+            save(step / "run.json", prior)
+            save(step / "summary.json", {"results": [{"fraction": f} for f in [0., 1., .01, .1]]})
+            result = diagnostic.check_pair_provenance(source, joint, step, .012)
+            self.assertEqual(result["source_link_sha256"], run["source_link_sha256"])
+            with self.assertRaisesRegex(ValueError, "scale"):
+                diagnostic.check_pair_provenance(source, joint, step, .013)
+            save(joint / "checkpoint/adapter.pt", "different update")
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                diagnostic.check_pair_provenance(source, joint, step, .012)
+
+
 @unittest.skipUnless(all(importlib.util.find_spec(n) for n in ("torch", "transformers")),
                      "requires torch and transformers")
 class DiagnosticRuntimeTests(unittest.TestCase):
