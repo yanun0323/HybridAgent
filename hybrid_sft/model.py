@@ -178,26 +178,26 @@ class HybridSFTModel(HybridAgentModel):
                 "target_id": target.detach(), "substitution_position": entry + 1,
                 "target_position": target_pos}
 
-    def _link_three_step(self, input_ids, attention_mask, latent_mask):
-        """Three recursive inputs, mean CE after each; no teacher content or cache.
+    def _link_rollout(self, input_ids, attention_mask, latent_mask, steps):
+        """Three or six recursive inputs, mean CE after each; no teacher content or cache.
 
         Full-prefix recomputation matches the one-input smoke path, NOT the
-        sequential cached diagnostic. No detach between the three predictions.
-        This is exposed only to the standalone gradient probe, not train.py.
+        sequential cached diagnostic. No detach between predictions.
+        This is exposed only to standalone experiments, not train.py.
         """
         if input_ids.shape[0] != 1:
-            raise ValueError("three-step probe requires batch size one")
+            raise ValueError("recursive probe requires batch size one")
         if any(p.requires_grad for p in self.backbone.parameters()):
-            raise ValueError("three-step probe requires a fully frozen backbone")
+            raise ValueError("recursive probe requires a fully frozen backbone")
         self.backbone.eval()
         positions = (latent_mask[0].bool() & attention_mask[0].bool()).nonzero().flatten()
-        if positions.numel() < 4:
-            raise ValueError("three-step probe requires entry and three content tokens")
+        if positions.numel() < steps + 1:
+            raise ValueError(f"recursive probe requires entry and {steps} content tokens")
         entry = positions[0].item()
-        if (positions[:4].tolist() != list(range(entry, entry + 4))
-                or entry + 4 >= input_ids.shape[1]
-                or not attention_mask[0, :entry + 5].bool().all()):
-            raise ValueError("three-step probe requires an unpadded contiguous span and following target")
+        if (positions[:steps + 1].tolist() != list(range(entry, entry + steps + 1))
+                or entry + steps + 1 >= input_ids.shape[1]
+                or not attention_mask[0, :entry + steps + 2].bool().all()):
+            raise ValueError("recursive probe requires an unpadded contiguous span and following target")
         decoder = text_decoder(self.backbone)
         with torch.no_grad():
             prefix = self.backbone.get_input_embeddings()(input_ids[:, :entry + 1])
@@ -210,7 +210,7 @@ class HybridSFTModel(HybridAgentModel):
                            use_cache=False, return_dict=True).last_hidden_state[:, -1:]
 
         vectors, losses, predicted_ids = [], [], []
-        for step in range(3):
+        for step in range(steps):
             with torch.autocast(device_type=prefix.device.type, enabled=False):
                 prediction = self.run_hybridlink(hidden, output_dtype=torch.float32)
             vectors.append(prediction)
@@ -229,9 +229,9 @@ class HybridSFTModel(HybridAgentModel):
         return {"loss": step_losses.mean(), "step_losses": step_losses,
                 "predicted_ids": torch.stack(predicted_ids, dim=1),
                 "rollout_vectors": tuple(vectors),
-                "target_ids": input_ids[:, entry + 2:entry + 5].detach(),
-                "substitution_positions": list(range(entry + 1, entry + 4)),
-                "target_positions": list(range(entry + 2, entry + 5))}
+                "target_ids": input_ids[:, entry + 2:entry + steps + 2].detach(),
+                "substitution_positions": list(range(entry + 1, entry + steps + 1)),
+                "target_positions": list(range(entry + 2, entry + steps + 2))}
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -278,8 +278,8 @@ class HybridSFTModel(HybridAgentModel):
         stage: str = SELF_CONDITIONED,
         link_steps: int = 1,
     ) -> Dict[str, torch.Tensor]:
-        if link_steps not in (1, 3) or (link_steps != 1 and stage != LINK_NEXT_TOKEN):
-            raise ValueError("link_steps must be 1, or 3 with link_next_token for the gradient probe")
+        if link_steps not in (1, 3, 6) or (link_steps != 1 and stage != LINK_NEXT_TOKEN):
+            raise ValueError("link_steps must be 1, or 3/6 with link_next_token for standalone experiments")
         if loss_mask is None:
             loss_mask = attention_mask
         if latent_mask is None:
@@ -288,8 +288,8 @@ class HybridSFTModel(HybridAgentModel):
         if stage == HYBRIDLINK_ACTIVATION:
             return self._link_activation(input_ids, attention_mask, latent_mask)
         if stage == LINK_NEXT_TOKEN:
-            if link_steps == 3:
-                return self._link_three_step(input_ids, attention_mask, latent_mask)
+            if link_steps in (3, 6):
+                return self._link_rollout(input_ids, attention_mask, latent_mask, link_steps)
             return self._link_next_token(input_ids, attention_mask, latent_mask)
 
         embed_layer = self.backbone.get_input_embeddings()

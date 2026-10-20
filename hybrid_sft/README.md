@@ -570,7 +570,7 @@ These 48 records did not participate in the eight-record joint update, but they
 were used in earlier training: they are not a held-out test or evidence of
 recursive-generation success. The reserved test remains unopened.
 
-### Three-input backward-only probe
+### Three- or six-input backward-only probe
 
 Before attempting recursive training, `scripts/link_three_step_probe.py` checks
 one backward pass through three predicted inputs on the **first training record**:
@@ -586,7 +586,7 @@ This deliberately starts from the original 64-step activation checkpoint, not th
 10% interpolated diagnostic weights. It tests gradient feasibility, not whether
 that diagnostic improvement is preserved. No optimizer is created, no weights are
 updated or exported, and no development/test records are read. The standalone
-probe uses `LINK_NEXT_TOKEN` with `link_steps=3`; the training CLI remains limited
+probe uses `LINK_NEXT_TOKEN` with `link_steps=3` by default; the training CLI remains limited
 to its existing single-input smoke path.
 
 The known prefix ends at the entry anchor. Each prediction is fed back through
@@ -605,17 +605,39 @@ A successful backward pass alone does not establish agreement between those path
 scale, seed and code version before model loading. `forward.json` saves per-step
 CE and target/substitution positions before backward. `summary.json` reports link
 and per-input gradient norms, peak allocated GPU memory and elapsed time. All
-three input gradients must be finite and nonzero. Backbone/LoRA/anchors must remain
+selected input gradients must be finite and nonzero. Backbone/LoRA/anchors must remain
 frozen, gradient-free and have unchanged tensor versions; link tensors are compared
 exactly to their pre-backward copies, and source link/LoRA file hashes are rechecked.
 The backbone check avoids duplicating 27B weights and is not a full bytewise
 comparison. Outputs must use a new directory; failures are never resumed.
 
-Tests on a tiny LoRA model compare the checkpointed three-step objective and link
+Tests on a tiny LoRA model compare the checkpointed three- and six-step objectives and link
 gradients with an independent uncheckpointed rollout, verify that the final loss
-reaches all three input vectors, and check that future/target tokens do not leak
+reaches every input vector, and check that future/target tokens do not leak
 into the decoder. Actual A100 memory and runtime remain to be measured. This probe
 makes no claim of improved CE, generation, natural exits, or reasoning ability.
+
+For the six-input feasibility check, use the same first training record and original
+64-step source, changing only the rollout length and output directory:
+
+```bash
+python -u scripts/link_three_step_probe.py --link-steps 6 \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-six-step-probe
+```
+
+Six predicted inputs are fed without detach. The objective averages six CEs at
+`entry+2` through `entry+7`; no correct content embeddings are fed. The forward
+report includes target and predicted text for all six positions. The probe checks
+finite nonzero gradients for all six inputs and the link, with the same frozen
+weight and source-file checks. It does not start from the eight-update checkpoint,
+does not read development/test questions, and does not update/export weights.
+The tiny-model tests also check final-loss reachability, independent uncheckpointed
+gradient equivalence, no target leakage, and short/discontiguous span rejection at
+both lengths. This does not establish six-step cached equivalence or A100 memory
+feasibility; those cannot be inferred from the three-step run. Preserve any failed
+output and log rather than retrying with changed settings in place.
 
 ### Compare full-prefix and cached execution
 

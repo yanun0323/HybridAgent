@@ -1,4 +1,4 @@
-"""One training record, three recursive inputs, backward only. Never update/save weights."""
+"""One training record, three or six recursive inputs, backward only. Never update/save weights."""
 from __future__ import annotations
 
 import argparse
@@ -41,6 +41,7 @@ def main():
     p.add_argument('--model', required=True)
     p.add_argument('--calibration', required=True)
     p.add_argument('--output-dir', required=True)
+    p.add_argument('--link-steps', type=int, choices=(3, 6), default=3)
     args = p.parse_args()
     source, output = Path(args.model).resolve(), Path(args.output_dir).resolve()
     for protected in (source, Path(args.pilot).resolve()):
@@ -81,8 +82,10 @@ def main():
     if sample is None:
         raise ValueError('training record rejected')
     positions = [i for i, value in enumerate(sample['latent_mask']) if value]
-    if len(positions) < 4 or positions[:4] != list(range(positions[0], positions[0] + 4)):
-        raise ValueError('requires entry and three contiguous content inputs')
+    count = args.link_steps + 1
+    if (len(positions) < count or positions[:count] != list(range(positions[0], positions[0] + count))
+            or positions[0] + count >= len(sample['input_ids'])):
+        raise ValueError('requires entry, contiguous content inputs and a following target')
     batch = collate_batch(tokenizer, [sample])
     output.mkdir(parents=True)
     hashes = {'source_link_sha256': sha256(source / 'adapter.pt'),
@@ -92,7 +95,7 @@ def main():
         'sample_id': row['id'], 'question': row['question'],
         'sample_sha256': hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest(),
         'input_ids_sha256': hashlib.sha256(json.dumps(sample['input_ids']).encode()).hexdigest(),
-        'calibration': calibration, 'seed': 6064, 'link_steps': 3, 'optimizer_steps': 0,
+        'calibration': calibration, 'seed': 6064, 'link_steps': args.link_steps, 'optimizer_steps': 0,
         'torch': torch.__version__,
         'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
     })
@@ -115,13 +118,15 @@ def main():
     raw.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
-    out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=3)
+    out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=args.link_steps)
     if not torch.isfinite(out['step_losses']).all():
-        raise RuntimeError('nonfinite three-step loss')
-    forward = {'sample_id': row['id'], 'mean_ce': out['loss'].detach().item(),
+        raise RuntimeError('nonfinite recursive loss')
+    forward = {'link_steps': args.link_steps, 'sample_id': row['id'], 'mean_ce': out['loss'].detach().item(),
                'step_ce': out['step_losses'].detach().tolist(),
                'target_ids': out['target_ids'].tolist()[0],
                'target_texts': [tokenizer.decode([t]) for t in out['target_ids'].tolist()[0]],
+               'predicted_ids': out['predicted_ids'].tolist()[0],
+               'predicted_texts': [tokenizer.decode([t]) for t in out['predicted_ids'].tolist()[0]],
                'substitution_positions': out['substitution_positions'],
                'target_positions': out['target_positions']}
     write_json(output / 'forward.json', forward)
