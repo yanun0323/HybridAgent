@@ -677,6 +677,8 @@ advance; improvement is not guaranteed.
 
 `run.json` saves settings, source/data/input hashes and exact IDs. `before.json`,
 `gradients.json` and `after.json` preserve measurements around the sole update.
+Per-record measurements also stream to phase JSONL files; `updates.jsonl` records
+completed updates and gradient reports.
 `summary.json` separates update/observation groups and full/cached paths, including
 per-position CE, individual changes, counts of regressions, and counts with all
 three argmax predictions correct. Lower average CE does not hide the per-position
@@ -691,6 +693,37 @@ on all sixteen records with exact metric equality required. This is a saved-link
 replay, not a fresh reload of the 27B backbone. Source hashes are rechecked, and
 backbone parameter versions and absence of gradients are checked around the step.
 Existing outputs are rejected. Failed runs are not resumed or overwritten.
+
+### Fixed eight-update pass over all 64 training records
+
+The same script accepts `--all-train` for one fixed-order pass starting from the
+original 64-step activation checkpoint, not the prior three-input update:
+
+```bash
+python -u scripts/link_three_step_joint.py --all-train \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-three-step-pass-64
+```
+
+All 64 unique records are used in file order, in eight consecutive groups of eight.
+A single fresh AdamW optimizer retains its moments across the eight updates at
+fixed `5e-6`. Each update averages 24 position losses, clips once, steps once, and
+clears gradients. There is no shuffle, scheduler, resume, intermediate checkpoint,
+loss-based selection, or early success stop. Invalid/nonfinite gradients or changed
+frozen weights stop the run. Only the final link is exported after eight updates.
+
+All 64 records are measured before any update and after the final update, on both
+execution paths, then replayed exactly using saved link tensors. `run.json` records
+the eight ordered ID groups. `updates.jsonl` and `gradients-step-N.json` retain each
+completed update's gradient report and pre-update metrics. Those group metrics are
+measured at different weights and must not be treated as a common baseline.
+`before.jsonl`, `after.jsonl`, and `reloaded.jsonl` stream per-record measurements.
+The full paired report is in `summary.json` under `update`; `observation` is empty.
+Terminal output includes aggregates and any per-position CE regression over `1e-6`
+or correct-to-wrong prediction. Every record is training data; no development or
+reserved test data is read. Three-position improvement does not establish complete
+reasoning or natural exit behavior. Failed outputs and logs must be preserved.
 
 ### Remaining 48 records after the three-input update
 

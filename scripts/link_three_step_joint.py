@@ -1,4 +1,4 @@
-"""One fixed eight-record, three-input update; compare full-prefix and cached CE."""
+"""Fixed three-input updates: first eight records once, or all 64 in eight groups."""
 from __future__ import annotations
 
 import argparse
@@ -34,6 +34,33 @@ def accumulate(model, batches, stage, backward, tokenizer):
     return results
 
 
+def training_plan(rows, all_train=False):
+    select_record(rows)  # exactly 64 unique records, fixed file order
+    update, observe = (rows, []) if all_train else select_rows(rows)
+    return update, observe, [update[i:i + 8] for i in range(0, len(update), 8)]
+
+
+def train_group(model, batches, stage, accelerator, optimizer, tokenizer, check_frozen, max_grad_norm):
+    """One averaged update; caller retains the optimizer across groups."""
+    import torch
+    raw = accelerator.unwrap_model(model)
+    optimizer.zero_grad(set_to_none=True)
+    metrics = accumulate(model, batches, stage, accelerator.backward, tokenizer)
+    grads = gradient_report(raw.hybridlink.named_parameters())
+    check_frozen()
+    norm = accelerator.clip_grad_norm_(raw.hybridlink.parameters(), max_grad_norm)
+    if not torch.isfinite(norm):
+        raise RuntimeError('nonfinite clipping norm')
+    report = {'norms_before_clip': grads, 'total_norm_before_clip': norm.item(),
+              'learning_rate': optimizer.param_groups[0]['lr']}
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    if any(not torch.isfinite(p).all() for p in raw.hybridlink.parameters()):
+        raise RuntimeError('nonfinite HybridLink after update')
+    check_frozen()
+    return metrics, report
+
+
 def compare_group(rows, before, after):
     if not rows or len(rows) != len(before) or len(rows) != len(after):
         raise ValueError('comparison row counts differ')
@@ -66,6 +93,8 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--calibration', required=True)
     parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--all-train', action='store_true',
+                        help='64 records in fixed order, eight updates; final checkpoint only')
     args = parser.parse_args()
     source, output = Path(args.model).resolve(), Path(args.output_dir).resolve()
     for protected in (source, Path(args.pilot).resolve()):
@@ -75,8 +104,7 @@ def main():
         raise FileExistsError('output exists; no resume or overwrite')
     data, _ = verify_data(args.pilot, 'train')
     rows = [json.loads(s) for s in data.read_text().splitlines() if s.strip()]
-    select_record(rows)  # validate 64 unique training records
-    update, observe = select_rows(rows)
+    update, observe, groups = training_plan(rows, args.all_train)
     rows = update + observe
     source_args = json.loads((source / 'train_args.json').read_text())
     if source_args['stage'] != 'hybridlink_activation' or source_args.get('max_steps') != 64:
@@ -125,7 +153,9 @@ def main():
            'update_ids': [r['id'] for r in update], 'observation_ids': [r['id'] for r in observe],
            'input_ids_sha256': [hashlib.sha256(json.dumps(s['input_ids']).encode()).hexdigest() for s in samples],
            'calibration': calibration, 'seed': 6064, 'learning_rate': LR,
-           'gradient_average_count': 8, 'link_steps': 3, 'planned_optimizer_steps': 1,
+           'gradient_average_count': 8, 'link_steps': 3, 'planned_optimizer_steps': len(groups),
+           'all_train': args.all_train, 'shuffle': False, 'scheduler': None,
+           'update_groups': [[r['id'] for r in group] for group in groups],
            'adam_betas': ADAM_BETAS, 'weight_decay': WEIGHT_DECAY, 'max_grad_norm': MAX_GRAD_NORM,
            'torch': torch.__version__,
            'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}
@@ -162,29 +192,43 @@ def main():
             del out
         return result
 
-    before = {'cached': [measure_cached(s) for s in samples]}
-    observed_before = [measure_full(b) for b in batches[8:]]
-    optimizer.zero_grad(set_to_none=True)
-    update_before = accumulate(model, batches[:8], LINK_NEXT_TOKEN, accelerator.backward, tokenizer)
-    before['full'] = update_before + observed_before
+    def check_frozen():
+        if any(p.requires_grad or p.grad is not None or p._version != versions[n]
+               for n, p in raw.backbone.named_parameters()):
+            raise RuntimeError('backbone/LoRA/anchors not frozen')
+
+    def measure_all(phase):
+        result = {'full': [], 'cached': []}
+        with (output / f'{phase}.jsonl').open('x') as stream:
+            for row, batch, sample in zip(rows, batches, samples):
+                full, cached = measure_full(batch), measure_cached(sample)
+                result['full'].append(full)
+                result['cached'].append(cached)
+                stream.write(json.dumps({'id': row['id'], 'full': full, 'cached': cached}) + '\n')
+                stream.flush()
+                print(f'{phase} {row["id"]}: full={full["mean_ce"]:.8g} cached={cached["mean_ce"]:.8g}', flush=True)
+        return result
+
+    before = measure_all('before')
     write_json(output / 'before.json', before)
-    grads = gradient_report(raw.hybridlink.named_parameters())
-    if any(p.requires_grad or p.grad is not None or p._version != versions[n]
-           for n, p in raw.backbone.named_parameters()):
-        raise RuntimeError('backbone/LoRA/anchors not frozen')
-    norm = accelerator.clip_grad_norm_(raw.hybridlink.parameters(), MAX_GRAD_NORM)
-    if not torch.isfinite(norm):
-        raise RuntimeError('nonfinite clipping norm')
-    write_json(output / 'gradients.json', {'norms_before_clip': grads, 'total_norm_before_clip': norm.item(),
-                                         'learning_rate': optimizer.param_groups[0]['lr']})
-    optimizer.step()  # exactly once; no scheduler, no optimizer resume
-    optimizer.zero_grad(set_to_none=True)
+    with (output / 'updates.jsonl').open('x') as stream:
+        for step, group in enumerate(groups, 1):
+            start = (step - 1) * 8
+            metrics, grads = train_group(model, batches[start:start + 8], LINK_NEXT_TOKEN,
+                                         accelerator, optimizer, tokenizer, check_frozen, MAX_GRAD_NORM)
+            report = {'optimizer_step': step, 'ids': [r['id'] for r in group],
+                      'pre_update_metrics': metrics, **grads}
+            stream.write(json.dumps(report) + '\n')
+            stream.flush()
+            write_json(output / f'gradients-step-{step}.json', report)
+            if len(groups) == 1:
+                write_json(output / 'gradients.json', grads)
+            print(f'Update {step}/{len(groups)} complete', flush=True)
     updated = [k for k, v in raw.hybridlink.state_dict().items() if not torch.equal(v.detach().cpu(), link_before[k])]
     if not updated or any(not torch.isfinite(p).all() for p in raw.hybridlink.parameters()):
         raise RuntimeError('HybridLink unchanged or nonfinite after update')
     del link_before
-    after = {'full': [measure_full(b) for b in batches],
-             'cached': [measure_cached(s) for s in samples]}
+    after = measure_all('after')
     write_json(output / 'after.json', after)
     if any(p.requires_grad or p.grad is not None or p._version != versions[n]
            for n, p in raw.backbone.named_parameters()):
@@ -192,7 +236,7 @@ def main():
     checkpoint = output / 'checkpoint'
     raw.save_pretrained(checkpoint, tokenizer)
     write_json(checkpoint / 'train_args.json', {'stage': 'link_next_token', 'link_steps': 3,
-               'max_steps': 1, 'grad_accum': 8, 'batch_size': 1, 'hybridlink_lr': LR, 'source': str(source)})
+               'max_steps': len(groups), 'grad_accum': 8, 'batch_size': 1, 'hybridlink_lr': LR, 'source': str(source)})
     write_json(checkpoint / 'link_calibration.json', calibration)
     check_reference_config(checkpoint, source)
     if json.loads((checkpoint / 'hybridlink_config.json').read_text()) != config:
@@ -208,28 +252,37 @@ def main():
         raise RuntimeError('saved link tensor mismatch')
     raw.hybridlink.load_state_dict(saved, strict=True)
     del saved, live
-    # Replay all sixteen records after reloading saved link tensors; backbone is
-    # not reloaded here. Saved LoRA/config equality was checked above.
-    reloaded = {'full': [measure_full(b) for b in batches],
-                'cached': [measure_cached(s) for s in samples]}
+    # Replay all selected records with saved link tensors, not a new backbone.
+    reloaded = measure_all('reloaded')
     if reloaded != after:
         write_json(output / 'reload-mismatch.json', reloaded)
         raise RuntimeError('saved-link replay differs from post-update metrics')
     if any(sha256(source / name) != value for name, value in hashes.items()):
         raise RuntimeError('source files changed')
-    summary = {'optimizer_steps': 1, 'gradient_average_count': 8, 'link_steps': 3,
+    summary = {'optimizer_steps': len(groups), 'gradient_average_count': 8, 'link_steps': 3,
                'learning_rate': LR, 'scale': raw.output_scale, 'updated_link_tensors': updated,
                'lora_anchors_unchanged': True, 'saved_link_replay_exact': True,
                'checkpoint': str(checkpoint), 'saved_link_sha256': sha256(checkpoint / 'adapter.pt'),
                'peak_gpu_gib': torch.cuda.max_memory_allocated() / 1024**3,
                'elapsed_seconds': time.monotonic() - started,
-               'update': {path: compare_group(update, before[path][:8], after[path][:8]) for path in before},
-               'observation': {path: compare_group(observe, before[path][8:], after[path][8:]) for path in before},
+               'update': {path: compare_group(update, before[path][:len(update)], after[path][:len(update)]) for path in before},
+               'observation': {path: compare_group(observe, before[path][len(update):], after[path][len(update):])
+                               for path in before} if observe else {},
+               'backbone_unchanged': True, 'source_hashes_unchanged': True,
                'warning': 'Three-position training-set CE, not complete answers, exits or generalization. '
                           'Observation rows participated in earlier training. Full-prefix grad-enabled vs '
                           'cached no-grad, both BF16 autocast. No claim that longer rollout improves.'}
     write_json(output / 'summary.json', summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    compact = {k: v for k, v in summary.items() if k not in ('update', 'observation')}
+    for group in ('update', 'observation'):
+        compact[group] = {}
+        for path, result in summary[group].items():
+            compact[group][path] = {k: v for k, v in result.items() if k != 'rows'}
+            compact[group][path]['regressions'] = [
+                r for r in result['rows'] if any(d > 1e-6 for d in r['delta_step_ce']) or
+                any(a == t and b != t for a, b, t in zip(r['before']['predicted_ids'],
+                    r['after']['predicted_ids'], r['before']['target_ids']))]
+    print(json.dumps(compact, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == '__main__':
