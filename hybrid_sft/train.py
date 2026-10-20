@@ -27,12 +27,12 @@ from hybrid_agent.lora import enable_format_lora, is_lora_model
 from hybrid_agent.compat import check_execution
 from hybrid_sft.calibration import read_training_calibration
 from hybrid_sft.data import HybridSFTDataset, collate_batch, resolve_data_file
-from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, STAGES, HybridSFTModel
+from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, LINK_NEXT_TOKEN, STAGES, HybridSFTModel
 
 # Epochs per stage. 1/1/1 and 1/1/2 are good practice as well; evaluate the saved HybridSFT
 # checkpoints (e.g. on AIME and MATH-500) and take the best one as the initialization for HybridRL.
-STAGE_EPOCHS = {FORMAT_ACTIVATION: 1, HYBRIDLINK_ACTIVATION: 2, SELF_CONDITIONED: 1}
-STAGE_HYBRIDLINK_LR = {HYBRIDLINK_ACTIVATION: 2e-4, SELF_CONDITIONED: 5e-5}
+STAGE_EPOCHS = {FORMAT_ACTIVATION: 1, HYBRIDLINK_ACTIVATION: 2, SELF_CONDITIONED: 1, LINK_NEXT_TOKEN: 1}
+STAGE_HYBRIDLINK_LR = {HYBRIDLINK_ACTIVATION: 2e-4, SELF_CONDITIONED: 5e-5, LINK_NEXT_TOKEN: 5e-5}
 
 WEIGHT_DECAY = 0.0
 ADAM_BETAS = (0.9, 0.95)
@@ -78,8 +78,12 @@ def parse_args():
         args.hybridlink_lr = STAGE_HYBRIDLINK_LR.get(args.stage, args.lr)
     if args.lora and args.stage != FORMAT_ACTIVATION:
         p.error("--lora currently supports format_activation only")
-    if (args.calibrate_link_scale or args.link_calibration) and args.stage != HYBRIDLINK_ACTIVATION:
-        p.error("link scale calibration requires hybridlink_activation")
+    if args.calibrate_link_scale and args.stage != HYBRIDLINK_ACTIVATION:
+        p.error("fresh scale calibration requires hybridlink_activation")
+    if args.link_calibration and args.stage not in (HYBRIDLINK_ACTIVATION, LINK_NEXT_TOKEN):
+        p.error("scale reuse requires a frozen link training stage")
+    if args.stage == LINK_NEXT_TOKEN and (args.max_steps != 1 or args.batch_size != 1 or args.grad_accum != 1):
+        p.error("link_next_token is a smoke test: require --max_steps 1 --batch_size 1 --grad_accum 1")
     if args.max_steps is not None and args.max_steps < 1:
         p.error("--max_steps must be positive")
     if args.num_workers < 0:
@@ -109,7 +113,7 @@ def main():
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum, mixed_precision="bf16")
     if args.lora and (accelerator.num_processes != 1 or str(accelerator.distributed_type).endswith("DEEPSPEED")):
         raise ValueError("LoRA format training requires one process without DeepSpeed")
-    link_only = args.stage == HYBRIDLINK_ACTIVATION
+    link_only = args.stage in (HYBRIDLINK_ACTIVATION, LINK_NEXT_TOKEN)
     if link_only:
         if accelerator.num_processes != 1 or str(accelerator.distributed_type).endswith("DEEPSPEED"):
             raise ValueError("frozen HybridLink activation requires one process without DeepSpeed")
@@ -155,7 +159,7 @@ def main():
     if args.lora:
         enable_format_lora(model, tokenizer, rank=args.lora_rank, alpha=args.lora_alpha)
     elif is_lora_model(model) and not link_only:
-        raise ValueError("a loaded LoRA checkpoint supports frozen hybridlink_activation only")
+        raise ValueError("a loaded LoRA checkpoint requires a frozen link training stage")
     lora_checkpoint = is_lora_model(model)
     model.set_trainable(args.stage)
     if not link_only:
@@ -258,6 +262,10 @@ def main():
                 )
                 if not torch.isfinite(out["loss"]):
                     raise RuntimeError("nonfinite training loss")
+                if args.stage == LINK_NEXT_TOKEN and is_main:
+                    print(f"Next-token CE={out['next_token_ce'].item():.8g} "
+                          f"substitution_position={out['substitution_position']} "
+                          f"target_position={out['target_position']} target_id={out['target_id'].item()}", flush=True)
                 accelerator.backward(out["loss"])
                 for key in ("loss", "backbone_loss", "hybridlink_loss"):
                     accum[key] += out[key].item()

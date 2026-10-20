@@ -186,6 +186,107 @@ class LoraTests(unittest.TestCase):
                 model.backbone.get_input_embeddings().requires_grad_(True)
                 model(**batch, stage=HYBRIDLINK_ACTIVATION)
 
+    def test_next_token_ce_reaches_link_only_and_excludes_future_tokens(self):
+        import torch
+        from unittest.mock import patch
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+        from hybrid_agent.lora import enable_format_lora
+        from hybrid_agent.compat import text_decoder, text_forward
+        from hybrid_sft.model import HybridSFTModel, LINK_NEXT_TOKEN
+
+        class Tokenizer:
+            unk_token_id = None
+            def __len__(self):
+                return 34
+            def encode(self, text, **kwargs):
+                return [{"<latent>": 32, "</latent>": 33}[text]]
+            def save_pretrained(self, directory):
+                (Path(directory) / "test-tokenizer.txt").write_text("anchors=32,33")
+
+        torch.manual_seed(17)
+        config = Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                             num_hidden_layers=1, num_attention_heads=2,
+                             num_key_value_heads=1, head_dim=8, tie_word_embeddings=False)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            Qwen3ForCausalLM(config).save_pretrained(root / "base")
+            model = HybridSFTModel.from_pretrained(root / "base", dtype=torch.float32)
+            enable_format_lora(model, Tokenizer(), rank=2, alpha=4)
+            model.output_scale = 0.02
+            model.set_trainable(LINK_NEXT_TOKEN)
+            model.train()
+            self.assertFalse(model.backbone.training)
+            ids = torch.tensor([[1, 32, 5, 7, 33, 6, 2]])
+            batch = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                     "latent_mask": torch.tensor([[0, 1, 1, 1, 0, 0, 0]])}
+            before = {n: p.detach().clone() for n, p in model.backbone.named_parameters()}
+            link_before = {n: p.detach().clone() for n, p in model.hybridlink.named_parameters()}
+            with torch.no_grad():
+                text_before = text_forward(model.backbone, input_ids=ids, return_dict=True).logits
+            decoder = text_decoder(model.backbone)
+            calls = []
+            original = decoder.forward
+            def checked_forward(*args, **kwargs):
+                self.assertFalse(kwargs["use_cache"])
+                self.assertNotIn("past_key_values", kwargs)
+                calls.append(kwargs["inputs_embeds"].detach().clone())
+                self.assertLessEqual(kwargs["inputs_embeds"].shape[1], 3)
+                return original(*args, **kwargs)
+            with patch.object(decoder, "forward", side_effect=checked_forward):
+                out = model(**batch, stage=LINK_NEXT_TOKEN)
+                self.assertTrue(out["loss"].requires_grad)
+                self.assertEqual(out["substitution_position"], 2)
+                self.assertEqual(out["target_position"], 3)
+                self.assertEqual(out["target_id"].item(), 7)
+                out["loss"].backward()
+            self.assertGreaterEqual(len(calls), 3)  # includes checkpoint recomputation
+            self.assertEqual(calls[0].shape[1], 2)
+            expected_input = model.backbone.get_input_embeddings()(ids[:, :2]).detach()
+            torch.testing.assert_close(calls[0], expected_input)
+            torch.testing.assert_close(calls[1][:, :2], expected_input)
+            torch.testing.assert_close(calls[1], calls[-1])
+            self.assertFalse(torch.equal(calls[1][:, 2:], model.backbone.get_input_embeddings()(ids[:, 2:3])))
+            gradients = [p.grad for p in model.hybridlink.parameters()]
+            self.assertTrue(all(g is not None and torch.isfinite(g).all() for g in gradients))
+            self.assertTrue(any(g.abs().sum() > 0 for g in gradients))
+            # The target and future tokens cannot leak into the decoder's inputs.
+            with torch.no_grad():
+                altered = ids.clone()
+                altered[0, 2] = 12  # replaced input is never read
+                altered[0, 4:] = 13  # future suffix is never read
+                other = model(**{**batch, "input_ids": altered}, stage=LINK_NEXT_TOKEN)
+                torch.testing.assert_close(other["loss"], out["loss"], rtol=0, atol=0)
+                # Independent CE from the captured second-pass inputs, no checkpoint.
+                hidden = decoder(inputs_embeds=calls[1], attention_mask=torch.ones(1, 3, dtype=torch.long),
+                                 use_cache=False, return_dict=True).last_hidden_state[:, -1:]
+                logits = model.backbone.get_output_embeddings()(hidden).float()
+                expected_ce = torch.nn.functional.cross_entropy(logits[:, -1], torch.tensor([7]))
+                torch.testing.assert_close(expected_ce, out["loss"])
+            optimizer = torch.optim.AdamW(model.hybridlink.parameters(), lr=1e-3)
+            optimizer.step()
+            self.assertTrue(any(not torch.equal(p, link_before[n]) for n, p in model.hybridlink.named_parameters()))
+            for n, p in model.backbone.named_parameters():
+                self.assertIsNone(p.grad)
+                self.assertFalse(p.requires_grad)
+                self.assertTrue(torch.equal(p, before[n]))
+            with torch.no_grad():
+                text_after = text_forward(model.backbone, input_ids=ids, return_dict=True).logits
+                loss_after = model(**batch, stage=LINK_NEXT_TOKEN)["loss"]
+            torch.testing.assert_close(text_after, text_before, rtol=0, atol=0)
+            model.save_pretrained(root / "saved", Tokenizer())
+            restored = HybridSFTModel.from_pretrained(root / "saved", dtype=torch.float32)
+            restored.set_trainable(LINK_NEXT_TOKEN)
+            self.assertEqual(restored.output_scale, model.output_scale)
+            with torch.no_grad():
+                torch.testing.assert_close(restored(**batch, stage=LINK_NEXT_TOKEN)["loss"], loss_after, rtol=0, atol=0)
+            with self.assertRaisesRegex(ValueError, "nonempty"):
+                model(**{**batch, "latent_mask": torch.zeros_like(ids)}, stage=LINK_NEXT_TOKEN)
+            with self.assertRaisesRegex(ValueError, "batch size one"):
+                model(**{k: v.repeat(2, 1) for k, v in batch.items()}, stage=LINK_NEXT_TOKEN)
+            model.backbone.get_input_embeddings().requires_grad_(True)
+            with self.assertRaisesRegex(ValueError, "fully frozen"):
+                model(**batch, stage=LINK_NEXT_TOKEN)
+
     def test_one_step_schedule_has_nonzero_first_update(self):
         import torch
         from hybrid_sft.train import cosine_schedule_with_warmup

@@ -378,3 +378,43 @@ known correct tokens: these conditions are diagnostic oracles, not deployable
 inference methods. Improvement supports a role for that intervention in these two
 trajectories; it does not establish general reasoning gains or an exclusive cause.
 The default substitution suite and all autonomous evaluation rules are unchanged.
+
+### One-input next-token gradient smoke test
+
+`link_next_token` is an experimental **one-update-only** path, separate from both
+activation regression and full self-conditioning. It keeps the backbone, LoRA and
+anchor parameters frozen in eval mode and updates only FP32 HybridLink. For the
+first latent span it supplies the correct prefix through the entry anchor, predicts
+the first content embedding, feeds that prediction, and computes cross-entropy
+for the following token. No target or future token enters the decoder inputs.
+
+The teacher prefix pass has no gradients. The second decoder pass has input
+gradients enabled despite frozen weights; non-reentrant whole-pass checkpointing
+recomputes that pass on backward. It uses no cache, so no mutable recurrent cache
+is reused during recomputation. It does **not** yet reproduce sequential cached
+inference or train a multi-step recursive rollout. Whole-pass checkpointing does
+not guarantee low peak memory during backward; measure on the target A100.
+
+```bash
+python -u -m hybrid_sft.train --stage link_next_token \
+  --model /content/qwen-link-64 --data /content/format-pilot/train.jsonl \
+  --output_dir /content/qwen-link-next-token-smoke \
+  --link_calibration /content/qwen-link-smoke/link_calibration.json \
+  --hybridlink_lr 5e-5 --epochs 1 --batch_size 1 --grad_accum 1 --max_steps 1 \
+  --max_length 1024 --num_workers 0 --save_steps 0 --seed 6064
+```
+
+The CLI rejects larger step counts, batches or accumulation for this smoke path.
+Start from the fixed 64-step link checkpoint and reuse its training-only scale.
+The printed target ID/position makes the one-step alignment inspectable. The loss
+is **only next-token CE**, not cosine/MSE; their logged zeros mean omitted terms,
+not perfect alignment. `backbone_loss=0` does not describe text accuracy. Finite
+nonzero link gradients and no backbone gradients are checked before the update.
+Saved output is separate from its source and retains the compact LoRA format.
+
+The tiny-model regression test checks actual CE gradients through the frozen
+PEFT decoder, exact input/target positions, checkpoint recomputation, exclusion of
+future tokens, changed link weights, unchanged backbone weights/text logits and
+save/load equality. Pass this in Colab before the real 27B smoke. Passing one step
+establishes only differentiability and resource feasibility, not improved latent
+reasoning. No long training or reserved-test evaluation is authorized by this path.

@@ -66,7 +66,8 @@ HybridRL are deliberately rejected until mixed-state continuation and replay
 agreement are validated. This does not make the original full-parameter SFT
 pipeline fit on a single GPU. Optional single-process LoRA format activation is
 documented in `hybrid_sft/README.md`, along with frozen HybridLink activation
-from a saved LoRA checkpoint. LoRA self-conditioning and RL remain unsupported.
+from a saved LoRA checkpoint and a one-input next-token gradient smoke test.
+LoRA self-conditioning and RL remain unsupported.
 
 Training and inference share an explicit `enable_thinking=True` prompt builder.
 Unsupported template endings fail rather than silently skipping every sample.

@@ -17,8 +17,9 @@ from hybrid_agent.lora import is_lora_model
 
 FORMAT_ACTIVATION = "format_activation"
 HYBRIDLINK_ACTIVATION = "hybridlink_activation"
+LINK_NEXT_TOKEN = "link_next_token"
 SELF_CONDITIONED = "self_conditioned"
-STAGES = (FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED)
+STAGES = (FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, LINK_NEXT_TOKEN)
 
 # Latent regression weights (lambda_cos, lambda_mse) and the extra weight of the exit
 # anchor, whose regression target is Emb(</latent>).
@@ -35,7 +36,7 @@ class HybridSFTModel(HybridAgentModel):
     def set_trainable(self, stage: str) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
-        if stage == HYBRIDLINK_ACTIVATION:
+        if stage in (HYBRIDLINK_ACTIVATION, LINK_NEXT_TOKEN):
             # Keep the learned format, including LoRA and both anchor rows, fixed.
             self.backbone.requires_grad_(False)
             self.backbone.zero_grad(set_to_none=True)
@@ -126,6 +127,57 @@ class HybridSFTModel(HybridAgentModel):
                 "hybridlink_loss": loss.detach(), "cos_loss": cosine.mean().detach(),
                 "mse_loss": mse.mean().detach()}
 
+    def _link_next_token(self, input_ids, attention_mask, latent_mask):
+        """One substituted input, one next-token CE target; a gradient smoke test.
+
+        The first latent-mask position is the entry anchor. h[entry] predicts
+        Emb(content[0]); after feeding that prediction, supervise content[1]
+        (or the real exit if there is only one content token). No future token
+        enters either decoder pass. No cache is reused across gradient recompute.
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError("link_next_token requires batch size one")
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            raise ValueError("link_next_token requires a fully frozen backbone")
+        self.backbone.eval()
+        positions = (latent_mask[0].bool() & attention_mask[0].bool()).nonzero().flatten()
+        if positions.numel() < 2:
+            raise ValueError("link_next_token requires entry and nonempty latent content")
+        entry = positions[0].item()
+        target_pos = entry + 2
+        if (positions[1].item() != entry + 1 or target_pos >= input_ids.shape[1]
+                or not attention_mask[0, :target_pos + 1].bool().all()):
+            raise ValueError("link_next_token requires an unpadded prefix and a following target")
+        decoder = text_decoder(self.backbone)
+        prefix_mask = attention_mask[:, :entry + 1]
+        with torch.no_grad():
+            prefix = self.backbone.get_input_embeddings()(input_ids[:, :entry + 1])
+            teacher_hidden = decoder(inputs_embeds=prefix, attention_mask=prefix_mask,
+                                     use_cache=False, return_dict=True).last_hidden_state[:, -1:]
+        with torch.autocast(device_type=prefix.device.type, enabled=False):
+            prediction = self.run_hybridlink(teacher_hidden, output_dtype=prefix.dtype)
+        modified = torch.cat((prefix, prediction), dim=1)
+        mask = attention_mask[:, :entry + 2]
+
+        def next_hidden(embeddings):
+            # eval() disables dropout, not input gradients. Whole-pass checkpoint
+            # avoids saving decoder activations from this forward pass.
+            return decoder(inputs_embeds=embeddings, attention_mask=mask,
+                           use_cache=False, return_dict=True).last_hidden_state[:, -1:]
+
+        if torch.is_grad_enabled() and modified.requires_grad:
+            hidden = checkpoint(next_hidden, modified, use_reentrant=False)
+        else:
+            hidden = next_hidden(modified)
+        logits = self.backbone.get_output_embeddings()(hidden).float()
+        target = input_ids[:, target_pos]
+        loss = F.cross_entropy(logits[:, -1], target)
+        zero = loss.detach().new_zeros(())
+        return {"loss": loss, "backbone_loss": zero, "hybridlink_loss": loss.detach(),
+                "cos_loss": zero, "mse_loss": zero, "next_token_ce": loss.detach(),
+                "target_id": target.detach(), "substitution_position": entry + 1,
+                "target_position": target_pos}
+
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask = mask.float()
@@ -177,6 +229,8 @@ class HybridSFTModel(HybridAgentModel):
 
         if stage == HYBRIDLINK_ACTIVATION:
             return self._link_activation(input_ids, attention_mask, latent_mask)
+        if stage == LINK_NEXT_TOKEN:
+            return self._link_next_token(input_ids, attention_mask, latent_mask)
 
         embed_layer = self.backbone.get_input_embeddings()
         input_embeds = embed_layer(input_ids)
