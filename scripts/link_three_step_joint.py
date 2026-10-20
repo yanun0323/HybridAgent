@@ -1,4 +1,4 @@
-"""Fixed three-input updates: first eight records once, or all 64 in eight groups."""
+"""Fixed three/six-input joint update; three-input mode also supports a 64-record pass."""
 from __future__ import annotations
 
 import argparse
@@ -20,12 +20,14 @@ from latent_experiment import check_reference_config
 LR = 5e-6
 
 
-def accumulate(model, batches, stage, backward, tokenizer):
+def accumulate(model, batches, stage, backward, tokenizer, link_steps=3):
+    if link_steps not in (3, 6):
+        raise ValueError('link_steps must be 3 or 6')
     if len(batches) != 8:
         raise ValueError('requires exactly eight update records')
     results = []
     for i, batch in enumerate(batches):
-        out = model(**batch, stage=stage, link_steps=3)
+        out = model(**batch, stage=stage, link_steps=link_steps)
         metric, _ = measurements(out, tokenizer)
         backward(out['loss'] / 8)
         results.append(metric)
@@ -40,12 +42,12 @@ def training_plan(rows, all_train=False):
     return update, observe, [update[i:i + 8] for i in range(0, len(update), 8)]
 
 
-def train_group(model, batches, stage, accelerator, optimizer, tokenizer, check_frozen, max_grad_norm):
+def train_group(model, batches, stage, accelerator, optimizer, tokenizer, check_frozen, max_grad_norm, link_steps=3):
     """One averaged update; caller retains the optimizer across groups."""
     import torch
     raw = accelerator.unwrap_model(model)
     optimizer.zero_grad(set_to_none=True)
-    metrics = accumulate(model, batches, stage, accelerator.backward, tokenizer)
+    metrics = accumulate(model, batches, stage, accelerator.backward, tokenizer, link_steps=link_steps)
     grads = gradient_report(raw.hybridlink.named_parameters())
     check_frozen()
     norm = accelerator.clip_grad_norm_(raw.hybridlink.parameters(), max_grad_norm)
@@ -61,27 +63,30 @@ def train_group(model, batches, stage, accelerator, optimizer, tokenizer, check_
     return metrics, report
 
 
-def compare_group(rows, before, after):
+def compare_group(rows, before, after, link_steps=3):
+    if link_steps not in (3, 6):
+        raise ValueError('link_steps must be 3 or 6')
     if not rows or len(rows) != len(before) or len(rows) != len(after):
         raise ValueError('comparison row counts differ')
     for a, b in zip(before, after):
         for key in ('target_ids', 'target_positions', 'substitution_positions'):
             if a[key] != b[key]:
                 raise ValueError('objective positions changed')
-        if any(len(x[key]) != 3 for x in (a, b) for key in
+        if any(len(x[key]) != link_steps for x in (a, b) for key in
                ('step_ce', 'predicted_ids', 'target_ids', 'target_positions', 'substitution_positions')):
-            raise ValueError('expected three positions per record')
+            raise ValueError(f'expected {link_steps} positions per record')
     def scalar(metric, step=None):
-        return {'ce': sum(metric['step_ce']) / 3 if step is None else metric['step_ce'][step],
+        return {'ce': sum(metric['step_ce']) / link_steps if step is None else metric['step_ce'][step],
                 'target_id': metric['target_ids'], 'target_position': metric['target_positions'],
                 'substitution_position': metric['substitution_positions']}
     mean = comparison(rows, [scalar(x) for x in before], [scalar(x) for x in after])
-    steps = [comparison(rows, [scalar(x, i) for x in before], [scalar(x, i) for x in after]) for i in range(3)]
+    steps = [comparison(rows, [scalar(x, i) for x in before], [scalar(x, i) for x in after]) for i in range(link_steps)]
     for result in (mean, *steps):
         result.pop('rows')
+    count_name = 'three' if link_steps == 3 else 'six'
     return {'mean_ce': mean, 'steps': steps,
-            'all_three_correct_before': sum(a['predicted_ids'] == a['target_ids'] for a in before),
-            'all_three_correct_after': sum(a['predicted_ids'] == a['target_ids'] for a in after),
+            f'all_{count_name}_correct_before': sum(a['predicted_ids'] == a['target_ids'] for a in before),
+            f'all_{count_name}_correct_after': sum(a['predicted_ids'] == a['target_ids'] for a in after),
             'rows': [{'id': r['id'], 'question': r['question'], 'before': a, 'after': b,
                       'delta_step_ce': [y - x for x, y in zip(a['step_ce'], b['step_ce'])]}
                      for r, a, b in zip(rows, before, after)]}
@@ -95,7 +100,10 @@ def main():
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--all-train', action='store_true',
                         help='64 records in fixed order, eight updates; final checkpoint only')
+    parser.add_argument('--link-steps', type=int, choices=(3, 6), default=3)
     args = parser.parse_args()
+    if args.link_steps == 6 and args.all_train:
+        parser.error('six-input mode permits one eight-record update only')
     source, output = Path(args.model).resolve(), Path(args.output_dir).resolve()
     for protected in (source, Path(args.pilot).resolve()):
         if output == protected or output in protected.parents or protected in output.parents:
@@ -143,8 +151,8 @@ def main():
         if sample is None:
             raise ValueError(f'rejected record {row["id"]}')
         start, end = span_bounds(sample, entry, exit)
-        if end - start - 1 < 3:
-            raise ValueError('requires three content tokens')
+        if end - start - 1 < args.link_steps:
+            raise ValueError(f'requires {args.link_steps} content tokens')
         samples.append(sample)
         batches.append(collate_batch(tokenizer, [sample]))
     hashes = {name: sha256(source / name) for name in ('adapter.pt', 'lora/adapter_model.safetensors')}
@@ -153,7 +161,7 @@ def main():
            'update_ids': [r['id'] for r in update], 'observation_ids': [r['id'] for r in observe],
            'input_ids_sha256': [hashlib.sha256(json.dumps(s['input_ids']).encode()).hexdigest() for s in samples],
            'calibration': calibration, 'seed': 6064, 'learning_rate': LR,
-           'gradient_average_count': 8, 'link_steps': 3, 'planned_optimizer_steps': len(groups),
+           'gradient_average_count': 8, 'link_steps': args.link_steps, 'planned_optimizer_steps': len(groups),
            'all_train': args.all_train, 'shuffle': False, 'scheduler': None,
            'update_groups': [[r['id'] for r in group] for group in groups],
            'adam_betas': ADAM_BETAS, 'weight_decay': WEIGHT_DECAY, 'max_grad_norm': MAX_GRAD_NORM,
@@ -180,14 +188,14 @@ def main():
     started = time.monotonic()
 
     def measure_full(batch):
-        out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=3)
+        out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=args.link_steps)
         result, _ = measurements(out, tokenizer)
         del out  # keep only plain metrics, never retain graphs between rows
         return result
 
     def measure_cached(sample):
         with torch.no_grad(), accelerator.autocast():
-            out = cached_rollout(raw, sample, entry, exit)
+            out = cached_rollout(raw, sample, entry, exit, link_steps=args.link_steps)
             result, _ = measurements(out, tokenizer)
             del out
         return result
@@ -215,7 +223,7 @@ def main():
         for step, group in enumerate(groups, 1):
             start = (step - 1) * 8
             metrics, grads = train_group(model, batches[start:start + 8], LINK_NEXT_TOKEN,
-                                         accelerator, optimizer, tokenizer, check_frozen, MAX_GRAD_NORM)
+                                         accelerator, optimizer, tokenizer, check_frozen, MAX_GRAD_NORM, link_steps=args.link_steps)
             report = {'optimizer_step': step, 'ids': [r['id'] for r in group],
                       'pre_update_metrics': metrics, **grads}
             stream.write(json.dumps(report) + '\n')
@@ -235,7 +243,7 @@ def main():
         raise RuntimeError('backbone/LoRA/anchors changed')
     checkpoint = output / 'checkpoint'
     raw.save_pretrained(checkpoint, tokenizer)
-    write_json(checkpoint / 'train_args.json', {'stage': 'link_next_token', 'link_steps': 3,
+    write_json(checkpoint / 'train_args.json', {'stage': 'link_next_token', 'link_steps': args.link_steps,
                'max_steps': len(groups), 'grad_accum': 8, 'batch_size': 1, 'hybridlink_lr': LR, 'source': str(source)})
     write_json(checkpoint / 'link_calibration.json', calibration)
     check_reference_config(checkpoint, source)
@@ -259,17 +267,17 @@ def main():
         raise RuntimeError('saved-link replay differs from post-update metrics')
     if any(sha256(source / name) != value for name, value in hashes.items()):
         raise RuntimeError('source files changed')
-    summary = {'optimizer_steps': len(groups), 'gradient_average_count': 8, 'link_steps': 3,
+    summary = {'optimizer_steps': len(groups), 'gradient_average_count': 8, 'link_steps': args.link_steps,
                'learning_rate': LR, 'scale': raw.output_scale, 'updated_link_tensors': updated,
                'lora_anchors_unchanged': True, 'saved_link_replay_exact': True,
                'checkpoint': str(checkpoint), 'saved_link_sha256': sha256(checkpoint / 'adapter.pt'),
                'peak_gpu_gib': torch.cuda.max_memory_allocated() / 1024**3,
                'elapsed_seconds': time.monotonic() - started,
-               'update': {path: compare_group(update, before[path][:len(update)], after[path][:len(update)]) for path in before},
-               'observation': {path: compare_group(observe, before[path][len(update):], after[path][len(update):])
+               'update': {path: compare_group(update, before[path][:len(update)], after[path][:len(update)], link_steps=args.link_steps) for path in before},
+               'observation': {path: compare_group(observe, before[path][len(update):], after[path][len(update):], link_steps=args.link_steps)
                                for path in before} if observe else {},
                'backbone_unchanged': True, 'source_hashes_unchanged': True,
-               'warning': 'Three-position training-set CE, not complete answers, exits or generalization. '
+               'warning': f'{args.link_steps}-position training-set CE, not complete answers, exits or generalization. '
                           'Observation rows participated in earlier training. Full-prefix grad-enabled vs '
                           'cached no-grad, both BF16 autocast. No claim that longer rollout improves.'}
     write_json(output / 'summary.json', summary)

@@ -739,6 +739,42 @@ replay, not a fresh reload of the 27B backbone. Source hashes are rechecked, and
 backbone parameter versions and absence of gradients are checked around the step.
 Existing outputs are rejected. Failed runs are not resumed or overwritten.
 
+### One eight-record six-input update
+
+Use the same joint-update script with `--link-steps 6`, starting from the original
+64-step activation checkpoint, not either three-input updated checkpoint:
+
+```bash
+python -u scripts/link_three_step_joint.py --link-steps 6 \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-six-step-joint-8
+```
+
+The first eight records update and the next eight observe only, in fixed file
+order. Each record averages six recursive CEs, then divides by eight before
+backward: one objective over 48 positions. A fresh AdamW optimizer steps exactly
+once at `5e-6` after one gradient clip. No scheduler, resume or loss-based selection
+is used. Six-input mode rejects `--all-train`; three-input behavior remains the
+default. No development or reserved test data is read.
+
+All sixteen records are measured before/after on the full-prefix grad-enabled path
+and cached no-grad path with common BF16 autocast and FP32 link weights. The summary
+preserves six per-position reports, full per-record before/after metrics, and
+`all_six_correct_before`/`all_six_correct_after` counts for update and observation
+groups separately. Terminal output includes any position's CE increase over `1e-6`
+or correct-to-wrong prediction, even if that record's average improves. Three-input
+reports retain their existing `all_three_correct_*` names.
+
+The existing source hashes, frozen backbone checks, exact saved LoRA/anchor equality,
+configuration checks, and saved-link replay on all sixteen records and both paths
+remain required. No second 27B backbone is loaded for replay. Settings and streamed
+measurements use the same files as the three-input joint update. Only the final
+checkpoint is saved. GPU memory for eight accumulated backward passes and optimizer
+state must be measured; a successful one-record backward probe does not guarantee
+this run fits. Preserve failed output/logs, with no automatic retries or overwrites.
+This measures local training-set prediction, not complete reasoning or natural exits.
+
 ### Fixed eight-update pass over all 64 training records
 
 The same script accepts `--all-train` for one fixed-order pass starting from the
