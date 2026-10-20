@@ -648,3 +648,46 @@ vector cosine/max-absolute differences. No threshold chooses a winning path or
 updates weights. The source files, parameter versions and absence of gradients are
 checked after measurement. No development or test data is opened. An observed
 mismatch does not by itself identify a kernel bug or establish reasoning ability.
+
+### One eight-record three-input update
+
+After the gradient and execution probes, `scripts/link_three_step_joint.py` takes
+exactly one AdamW step from the original 64-step activation checkpoint:
+
+```bash
+python -u scripts/link_three_step_joint.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-three-step-joint-8
+```
+
+Selection is fixed: first eight training records update, next eight observe only.
+Each record's three recursive next-token CEs are averaged, divided by eight and
+backpropagated separately. The resulting objective is the mean over 24 positions.
+Graphs are freed between records; gradients are clipped once and AdamW steps once
+at `5e-6`, existing betas/weight decay, with no scheduler or optimizer resume.
+Backbone, LoRA and anchors remain frozen. No development/test split is read.
+
+Before and after the step, all sixteen records are measured on the grad-enabled
+full-prefix objective and on fresh-cache sequential execution with no gradients,
+using common BF16 autocast and FP32 HybridLink. This checks whether improvements
+transfer to cached execution, not just the training objective. Both are three-input
+rollouts, not complete answers or natural exits. The learning rate is fixed in
+advance; improvement is not guaranteed.
+
+`run.json` saves settings, source/data/input hashes and exact IDs. `before.json`,
+`gradients.json` and `after.json` preserve measurements around the sole update.
+`summary.json` separates update/observation groups and full/cached paths, including
+per-position CE, individual changes, counts of regressions, and counts with all
+three argmax predictions correct. Lower average CE does not hide the per-position
+reports. All observation records were available to earlier training, so this is
+not held-out generalization.
+
+The compact checkpoint is written under the new output directory. Saved LoRA and
+anchor tensors must equal the source exactly; tokenizer/manifest/scale are checked.
+Saved HybridLink tensors must match the in-memory FP32 tensors. Those link tensors
+are then reloaded into the existing model, and both execution paths are replayed
+on all sixteen records with exact metric equality required. This is a saved-link
+replay, not a fresh reload of the 27B backbone. Source hashes are rechecked, and
+backbone parameter versions and absence of gradients are checked around the step.
+Existing outputs are rejected. Failed runs are not resumed or overwritten.
