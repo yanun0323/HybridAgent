@@ -314,3 +314,39 @@ and scoring edge cases. A scripted-output test drives the real engine to verify
 vector feeds, natural/forced exits, budget stops and intact answer digits; it is
 an engine test, not evidence of learned reasoning. Large-model runs remain a
 separate target-GPU check.
+
+### Controlled substitution diagnostic
+
+When recursive generation fails despite lower activation loss, use
+`scripts/latent_diagnostic.py` on the fixed trained checkpoint. It uses only the
+first two `latent-dev` questions and never reads the reserved split:
+
+```bash
+python -u scripts/latent_diagnostic.py --directory /content/latent-pilot \
+  --model /content/qwen-link-64 --reference /content/format-pilot/checkpoint \
+  --output /content/latent-pilot/diagnostic-64.jsonl
+```
+
+Each question has four fresh-cache conditions: all correct reference embeddings,
+first one predicted vector, first four predicted vectors, and all predicted vectors.
+The prefix through `<latent>` is supplied from the known trajectory. Every condition
+uses identical segmentation (prompt prefill, then one assistant embedding per step).
+Predicted vectors are cast to the actual embedding dtype before both feeding and
+measurement. Only the first N latent-content inputs are substituted; remaining
+inputs use the correct reference tokens, allowing recovery to be observed.
+
+For every reference position and the expected exit position, JSONL records the
+next-token argmax, target probability, exit probability/rank, and cosine/RMS of the
+predicted vector versus the reference next-token embedding. At the reference span
+length, the real exit-anchor embedding is **forced** in all conditions; ordinary
+unmasked text generation then runs for at most 96 tokens. The continuation does
+not activate latent mode even if it emits more latent tags. It is a recovery probe,
+not the production hybrid engine or a speed test. Exit rank 1 can include ties;
+`exit_argmax` separately records whether argmax actually selected the exit.
+
+The summary includes initial and exit-position measurements, early exit argmax
+positions and full continuations. Exact trajectories and answer lengths are known
+to this diagnostic, so none of its outcomes count as autonomous reasoning success.
+It compares sequential execution, not full-sequence training execution; further
+segmentation comparisons may be needed if the all-reference control fails. No
+training, checkpoint modification, retuning, or change to evaluation rules occurs.
