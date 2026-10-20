@@ -10,6 +10,13 @@ AVAILABLE = all(importlib.util.find_spec(n) for n in ("torch", "transformers"))
 @unittest.skipUnless(AVAILABLE, "requires torch and transformers")
 class LatentEngineTests(unittest.TestCase):
     def test_actual_engine_natural_forced_and_budget_exits_preserve_answer(self):
+        self._check_engine(use_peft=False)
+
+    @unittest.skipUnless(importlib.util.find_spec("peft"), "requires peft")
+    def test_peft_engine_natural_forced_and_budget_exits_preserve_answer(self):
+        self._check_engine(use_peft=True)
+
+    def _check_engine(self, use_peft):
         import torch
         from unittest.mock import patch
         from hybrid_agent.engine import HybridGenerationEngine
@@ -26,6 +33,10 @@ class LatentEngineTests(unittest.TestCase):
                 return tokens.index(token)
             def get_vocab(self):
                 return {t: i for i, t in enumerate(tokens)}
+            def __len__(self):
+                return len(tokens)
+            def encode(self, text, **kwargs):
+                return [tokens.index(text)]
             def decode(self, ids, **kwargs):
                 return "".join(tokens[i] for i in ids)
         class Backbone(torch.nn.Module):
@@ -44,6 +55,26 @@ class LatentEngineTests(unittest.TestCase):
         for forced, budget in ((False, 20), (True, 20), (False, 3)):
             with self.subTest(forced=forced, budget=budget):
                 model, tokenizer = Model(), Tokenizer()
+                if use_peft:
+                    from transformers import Qwen3Config, Qwen3ForCausalLM
+                    from hybrid_agent.model import HybridAgentModel
+                    from hybrid_agent.lora import enable_format_lora
+                    config = Qwen3Config(vocab_size=len(tokens), hidden_size=4,
+                                         intermediate_size=8, num_hidden_layers=1,
+                                         num_attention_heads=2, num_key_value_heads=1,
+                                         head_dim=2, tie_word_embeddings=False)
+                    wrapped = HybridAgentModel(Qwen3ForCausalLM(config))
+                    enable_format_lora(wrapped, tokenizer, rank=2, alpha=4)
+                    with torch.no_grad():
+                        for name, p in wrapped.backbone.named_parameters():
+                            if "trainable_tokens_delta" in name:
+                                p.add_(0.25)
+                    wrapped.eval()
+                    model.backbone = wrapped.backbone
+                    embedding = model.backbone.get_input_embeddings()
+                    self.assertEqual(type(embedding).__name__, "TrainableTokensWrapper")
+                    with torch.no_grad():
+                        expected_exit = embedding(torch.tensor([3]))[0].clone()
                 engine = HybridGenerationEngine(model, tokenizer, torch.device("cpu"), None,
                     "", "q", batch_size=1, temperature=0, max_response_tokens=budget,
                     min_latent_steps=0, max_latent_steps=1 if forced else 64,
@@ -80,7 +111,12 @@ class LatentEngineTests(unittest.TestCase):
                     self.assertEqual(result["forced_exits"], int(forced))
                     self.assertEqual(result["anchor_exits"], int(not forced))
                     self.assertEqual(scored["success"], not forced)
-                    torch.testing.assert_close(fed[3][0, 0], model.backbone.embedding.weight[3])
+                    expected = expected_exit if use_peft else model.backbone.embedding.weight[3]
+                    torch.testing.assert_close(fed[3][0, 0], expected)
+                    if use_peft:
+                        with torch.no_grad():
+                            expected_entry = embedding(torch.tensor([2]))[0]
+                        torch.testing.assert_close(fed[1][0, 0], expected_entry)
 
 
 if __name__ == "__main__":

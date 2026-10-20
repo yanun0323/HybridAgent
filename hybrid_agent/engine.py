@@ -146,7 +146,8 @@ class HybridGenerationEngine:
             in_think.add(self.think_open_id)
             out_think.add(self.think_close_id)
         self.blocked_token_sets = {"in": frozenset(in_think), "out": frozenset(out_think)}
-        vocab = self.embed_layer.num_embeddings
+        # PEFT TrainableTokensWrapper exposes weight, not num_embeddings.
+        vocab = self.embed_layer.weight.shape[0]
         self._blocked_masks = {
             key: self._bool_mask(ids, vocab) for key, ids in self.blocked_token_sets.items()
         }
