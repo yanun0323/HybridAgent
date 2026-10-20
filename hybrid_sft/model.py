@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hybrid_agent.model import HybridAgentModel
-from hybrid_agent.compat import text_decoder
+from hybrid_agent.compat import text_decoder, base_backbone
+from hybrid_agent.lora import is_lora_model
 
 FORMAT_ACTIVATION = "format_activation"
 HYBRIDLINK_ACTIVATION = "hybridlink_activation"
@@ -34,12 +35,17 @@ class HybridSFTModel(HybridAgentModel):
     def set_trainable(self, stage: str) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+        if is_lora_model(self):
+            if stage != FORMAT_ACTIVATION:
+                raise ValueError("LoRA currently supports format_activation only")
+            self.hybridlink.requires_grad_(False)
+            return  # PEFT already selected LoRA weights and anchor rows; never unfreeze the base.
         train_backbone = stage in (FORMAT_ACTIVATION, SELF_CONDITIONED)
         train_link = stage in (HYBRIDLINK_ACTIVATION, SELF_CONDITIONED)
         for p in self.backbone.parameters():
             p.requires_grad = train_backbone
         if getattr(self.backbone.config, "model_type", None) == "qwen3_5":
-            self.backbone.model.visual.requires_grad_(False)
+            base_backbone(self.backbone).model.visual.requires_grad_(False)
         for p in self.hybridlink.parameters():
             p.requires_grad = train_link
 

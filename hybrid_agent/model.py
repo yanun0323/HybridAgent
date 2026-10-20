@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from .compat import LINK_CONFIG, backbone_load_path, checked_scale, read_link_config
 from .constants import ANCHOR_TOKENS
 from .hybridlink import HYBRIDLINK_CONFIG, HybridLink
+from .lora import LORA_MANIFEST, LORA_DIRECTORY, is_lora_model
 
 HYBRIDLINK_WEIGHTS = "adapter.pt"
 HYBRIDLINK_CONFIG_FILE = LINK_CONFIG
@@ -46,6 +47,8 @@ class HybridAgentModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.output_scale = 1.0
+        self.base_model_reference = None
+        self.base_model_revision = None
         hidden_size = backbone.get_input_embeddings().weight.shape[-1]
         self.hybridlink = hybridlink if hybridlink is not None else HybridLink(hidden_size)
         self.hybridlink.to(dtype=next(backbone.parameters()).dtype)
@@ -62,7 +65,12 @@ class HybridAgentModel(nn.Module):
     ) -> "HybridAgentModel":
         """Load the backbone and, when present, the HybridLink weights of a checkpoint."""
         local = resolve_model_dir(path_or_repo, revision)
-        with backbone_load_path(local) as load_path:
+        manifest_path = local / LORA_MANIFEST
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else None
+        base_spec = manifest["base_model"] if manifest else str(local)
+        base_revision = manifest.get("base_revision") if manifest else revision
+        base_local = resolve_model_dir(base_spec, base_revision) if manifest else local
+        with backbone_load_path(base_local) as load_path:
             config = AutoConfig.from_pretrained(str(load_path), trust_remote_code=trust_remote_code)
             loader = AutoModelForCausalLM
             if config.model_type == "qwen3_5":
@@ -71,7 +79,17 @@ class HybridAgentModel(nn.Module):
             backbone = loader.from_pretrained(
                 str(load_path), config=config, dtype=dtype, trust_remote_code=trust_remote_code
             )
+        if manifest:
+            from peft import PeftModel
+            backbone.resize_token_embeddings(manifest["vocab_size"])
+            backbone = PeftModel.from_pretrained(
+                backbone, str(local / LORA_DIRECTORY), is_trainable=False,
+            )
         model = cls(backbone)
+        model.base_model_reference = manifest["base_model"] if manifest else str(path_or_repo)
+        model.base_model_revision = base_revision or getattr(config, "_commit_hash", None)
+        if manifest:
+            model.lora_anchor_ids = manifest["anchor_ids"]
         weights = local / HYBRIDLINK_WEIGHTS
         if weights.is_file():
             link_config = read_link_config(local)
@@ -99,12 +117,36 @@ class HybridAgentModel(nn.Module):
 
     def resize_to_tokenizer(self, tokenizer) -> None:
         """Match the embedding table to the tokenizer (needed once for a fresh base model)."""
-        if self.backbone.get_input_embeddings().num_embeddings != len(tokenizer):
+        if self.backbone.get_input_embeddings().weight.shape[0] != len(tokenizer):
+            if is_lora_model(self):
+                raise ValueError("resize the base vocabulary before attaching LoRA")
             self.backbone.resize_token_embeddings(len(tokenizer))
 
     def save_pretrained(self, output_dir: str | os.PathLike, tokenizer=None, state_dict=None) -> None:
         """Write the backbone (HF format), tokenizer and HybridLink weights into one directory."""
         os.makedirs(output_dir, exist_ok=True)
+        if is_lora_model(self):
+            if state_dict is not None:
+                raise ValueError("LoRA save currently supports single-process training only")
+            if not self.base_model_reference:
+                raise ValueError("LoRA checkpoints require a base_model_reference")
+            if tokenizer is None:
+                raise ValueError("LoRA checkpoints require the matching tokenizer")
+            self.backbone.save_pretrained(
+                os.path.join(output_dir, LORA_DIRECTORY), save_embedding_layers=False,
+            )
+            tokenizer.save_pretrained(output_dir)
+            torch.save(self.hybridlink.state_dict(), os.path.join(output_dir, HYBRIDLINK_WEIGHTS))
+            with open(os.path.join(output_dir, HYBRIDLINK_CONFIG_FILE), "w") as f:
+                json.dump({**HYBRIDLINK_CONFIG, "output_scale": checked_scale(self.output_scale)}, f, indent=2)
+            with open(os.path.join(output_dir, LORA_MANIFEST), "w") as f:
+                json.dump({
+                    "base_model": self.base_model_reference,
+                    "base_revision": self.base_model_revision,
+                    "vocab_size": len(tokenizer),
+                    "anchor_ids": self.lora_anchor_ids,
+                }, f, indent=2)
+            return
         if state_dict is None:
             state_dict = self.state_dict()
         backbone_sd = {k[len("backbone."):]: v for k, v in state_dict.items() if k.startswith("backbone.")}
@@ -134,9 +176,13 @@ def load_hybrid_agent(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     model = HybridAgentModel.from_pretrained(
-        local, dtype=dtype, trust_remote_code=trust_remote_code,
+        path_or_repo, dtype=dtype, trust_remote_code=trust_remote_code,
         require_hybridlink=require_hybridlink, revision=revision,
     )
+    if hasattr(model, "lora_anchor_ids"):
+        actual_ids = [tokenizer.convert_tokens_to_ids(token) for token in ANCHOR_TOKENS]
+        if actual_ids != model.lora_anchor_ids:
+            raise ValueError("LoRA checkpoint tokenizer anchor IDs do not match the saved model")
     model.resize_to_tokenizer(tokenizer)
     if device is not None:
         model.to(device)

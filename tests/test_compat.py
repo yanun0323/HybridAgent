@@ -77,6 +77,16 @@ class CompatibilityTests(unittest.TestCase):
                                    model=SimpleNamespace(language_model=decoder))
         self.assertIs(compat.text_decoder(backbone), decoder)
 
+    def test_peft_wrapper_keeps_qwen_decoder_and_limits(self):
+        decoder = object()
+        base = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"),
+                               model=SimpleNamespace(language_model=decoder))
+        wrapper = SimpleNamespace(peft_config={"default": object()}, get_base_model=lambda: base)
+        self.assertIs(compat.text_decoder(wrapper), decoder)
+        self.assertTrue(compat.is_qwen_hybrid(wrapper))
+        with self.assertRaisesRegex(ValueError, "batch_size=1"):
+            compat.check_execution(wrapper, batch_size=2)
+
     def test_text_forward_routes_hidden_and_cache_without_multimodal_wrapper(self):
         class Hidden:
             def __getitem__(self, key):

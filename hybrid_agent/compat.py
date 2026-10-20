@@ -16,8 +16,14 @@ LINK_CONFIG = "hybridlink_config.json"
 LEGACY_LINK_CONFIG = "adapter_config.json"
 
 
+def base_backbone(backbone):
+    if hasattr(backbone, "peft_config") and hasattr(backbone, "get_base_model"):
+        return backbone.get_base_model()
+    return backbone
+
+
 def is_qwen_hybrid(backbone) -> bool:
-    return getattr(backbone.config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
+    return getattr(base_backbone(backbone).config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}
 
 
 def check_execution(backbone, *, batch_size=1, rl=False) -> None:
@@ -29,6 +35,7 @@ def check_execution(backbone, *, batch_size=1, rl=False) -> None:
 
 
 def text_decoder(backbone):
+    backbone = base_backbone(backbone)
     if getattr(backbone.config, "model_type", None) == "qwen3_5":
         return backbone.model.language_model
     return backbone.get_decoder()

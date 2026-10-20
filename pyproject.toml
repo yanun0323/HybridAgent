@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 sft = ["deepspeed>=0.15"]
+lora = ["peft==0.21.2"]
 wandb = ["wandb"]
 
 [build-system]

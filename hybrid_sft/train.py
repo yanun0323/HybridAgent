@@ -23,6 +23,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from hybrid_agent.model import add_anchor_tokens, resolve_model_dir
+from hybrid_agent.lora import enable_format_lora, is_lora_model
 from hybrid_sft.data import HybridSFTDataset, collate_batch, resolve_data_file
 from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, STAGES, HybridSFTModel
 
@@ -58,11 +59,23 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save_steps", type=int, default=2000)
     p.add_argument("--wandb", action="store_true")
+    p.add_argument("--lora", action="store_true", help="single-process format activation only")
+    p.add_argument("--lora_rank", type=int, default=8)
+    p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--max_steps", type=int, default=None, help="cap optimizer updates (e.g. 1 for a smoke test)")
+    p.add_argument("--num_workers", type=int, default=NUM_WORKERS)
+    p.add_argument("--revision", default=None, help="pin the base Hugging Face revision")
     args = p.parse_args()
     if args.epochs is None:
         args.epochs = STAGE_EPOCHS[args.stage]
     if args.hybridlink_lr is None:
         args.hybridlink_lr = STAGE_HYBRIDLINK_LR.get(args.stage, args.lr)
+    if args.lora and args.stage != FORMAT_ACTIVATION:
+        p.error("--lora currently supports format_activation only")
+    if args.max_steps is not None and args.max_steps < 1:
+        p.error("--max_steps must be positive")
+    if args.num_workers < 0:
+        p.error("--num_workers must be nonnegative")
     return args
 
 
@@ -86,10 +99,12 @@ def cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_s
 def main():
     args = parse_args()
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum, mixed_precision="bf16")
+    if args.lora and (accelerator.num_processes != 1 or str(accelerator.distributed_type).endswith("DEEPSPEED")):
+        raise ValueError("LoRA format training requires one process without DeepSpeed")
     set_seed(args.seed)
     is_main = accelerator.is_main_process
 
-    model_dir = resolve_model_dir(args.model)
+    model_dir = resolve_model_dir(args.model, args.revision)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
     add_anchor_tokens(tokenizer)
     tokenizer.padding_side = "left"
@@ -99,9 +114,14 @@ def main():
     if is_main:
         print(f"Loading model from {model_dir} ...", flush=True)
     model = HybridSFTModel.from_pretrained(
-        model_dir, dtype=torch.bfloat16, require_hybridlink=(args.stage != FORMAT_ACTIVATION),
+        args.model, revision=args.revision, dtype=torch.bfloat16,
+        require_hybridlink=(args.stage != FORMAT_ACTIVATION),
     )
     model.resize_to_tokenizer(tokenizer)
+    if args.lora:
+        enable_format_lora(model, tokenizer, rank=args.lora_rank, alpha=args.lora_alpha)
+    elif is_lora_model(model):
+        raise ValueError("continuing a LoRA checkpoint is not supported by this trainer yet")
     model.set_trainable(args.stage)
     model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -117,7 +137,7 @@ def main():
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
         collate_fn=lambda batch: collate_batch(tokenizer, batch),
-        num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=NUM_WORKERS > 0,
+        num_workers=args.num_workers, pin_memory=True, persistent_workers=args.num_workers > 0,
     )
 
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -143,10 +163,10 @@ def main():
     max_steps = args.epochs * steps_per_epoch
     if max_steps <= 0:
         raise ValueError("no optimizer steps: reduce grad_accum or batch_size, or use more data")
-    warmup_steps = max(1, int(max_steps * WARMUP_RATIO))
+    if args.max_steps is not None:
+        max_steps = min(max_steps, args.max_steps)
+    warmup_steps = min(max_steps - 1, max(1, int(max_steps * WARMUP_RATIO)))
     scheduler = cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps)
-    for group in optimizer.param_groups:  # first update at the step-0 learning rate
-        group["lr"] = 0.0
 
     os.makedirs(args.output_dir, exist_ok=True)
     wandb_run = None
@@ -165,13 +185,19 @@ def main():
 
     def save(ckpt_dir: str) -> None:
         accelerator.wait_for_everyone()
-        full_sd = accelerator.get_state_dict(model)  # collective
-        if is_main:
-            accelerator.unwrap_model(model).save_pretrained(ckpt_dir, tokenizer, full_sd)
-        del full_sd
+        if args.lora:
+            if is_main:
+                accelerator.unwrap_model(model).save_pretrained(ckpt_dir, tokenizer)
+        else:
+            full_sd = accelerator.get_state_dict(model)  # collective
+            if is_main:
+                accelerator.unwrap_model(model).save_pretrained(ckpt_dir, tokenizer, full_sd)
+            del full_sd
         accelerator.wait_for_everyone()
 
     model.train()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     global_step = 0
     pbar = tqdm(total=max_steps, desc=args.stage, disable=not is_main)
     accum = {"loss": 0.0, "backbone_loss": 0.0, "hybridlink_loss": 0.0, "n": 0}
@@ -189,6 +215,18 @@ def main():
                 accum["n"] += 1
 
                 if accelerator.sync_gradients:
+                    if args.lora and global_step == 0:
+                        raw_model = accelerator.unwrap_model(model)
+                        anchor_parameters = [p for name, p in raw_model.backbone.named_parameters()
+                                             if "trainable_tokens_delta" in name and p.requires_grad]
+                        if not anchor_parameters or not all(
+                            p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+                            for p in anchor_parameters
+                        ):
+                            raise RuntimeError("anchor rows did not receive finite nonzero gradients")
+                        if any(p.grad is not None for p in raw_model.backbone.parameters() if not p.requires_grad):
+                            raise RuntimeError("a frozen backbone parameter received gradients")
+                        print("Anchor gradients verified; frozen base has no parameter gradients", flush=True)
                     accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                     optimizer.step()
                     scheduler.step()
@@ -216,6 +254,8 @@ def main():
         if wandb_run is not None:
             wandb_run.finish()
         print(f"Saved to {args.output_dir}", flush=True)
+        if torch.cuda.is_available():
+            print(f"Peak GPU allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB", flush=True)
 
 
 if __name__ == "__main__":

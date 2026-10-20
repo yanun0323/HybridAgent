@@ -49,3 +49,53 @@ Epochs default to 1 / 2 / 1 for the three stages (`--epochs`; 1 / 1 / 1 and 1 / 
 ## Output
 
 Every checkpoint directory (`checkpoint-N/` and the final output) is a complete HybridAgent checkpoint: the backbone in Hugging Face format, the tokenizer with the anchor tokens, and the HybridLink weights (`adapter.pt`, `hybridlink_config.json`). It loads with `hybrid_agent.load_hybrid_agent` and is the initialization for HybridRL.
+
+
+## Experimental single-GPU LoRA format activation
+
+This is a resource-saving adaptation, not a reproduction of full-parameter
+HybridSFT. Only `format_activation` is supported; HybridLink stays frozen.
+PEFT LoRA targets text attention/DeltaNet/MLP projections, not vision layers.
+Only the `<latent>` and `</latent>` rows of the input embedding and untied output
+head are trainable; the complete vocabulary matrices are not optimizer parameters.
+PEFT may still materialize full embedding matrices during forward/backward, so
+GPU memory must be measured on the real model.
+
+Install the optional dependency in the existing environment:
+
+```bash
+pip install 'peft==0.21.2'
+pip install -e . --no-deps
+python -m unittest discover -s tests -v
+```
+
+Use plain Python, one process, without a DeepSpeed configuration. Start with one
+update and a short real JSONL trajectory using the data format above:
+
+```bash
+python -m hybrid_sft.train --stage format_activation \
+  --model Qwen/Qwen3.8-27B --data /content/format-smoke.jsonl \
+  --output_dir /content/qwen-format-smoke --lora \
+  --lora_rank 8 --lora_alpha 16 --lr 1e-4 \
+  --epochs 1 --batch_size 1 --grad_accum 1 --max_steps 1 \
+  --max_length 1024 --num_workers 0 --save_steps 0
+```
+
+A one-step smoke test has a nonzero initial learning rate. For longer runs the
+existing warmup/cosine schedule remains in use. The trainer does not evaluate a
+validation set or resume optimizer state; saved directories are model checkpoints,
+not resumable training-state snapshots. `--revision` can pin the base model.
+Do not launch this in a second process while a 27B model already occupies the GPU.
+
+LoRA saves contain the tokenizer, HybridLink weights/config, `lora/` PEFT files,
+and `hybrid_lora.json` recording the base reference/revision, vocabulary size and
+anchor IDs. They do not duplicate the base weights. A local base path must remain
+available; a Hub base is downloaded/cached on the destination machine. Reload with
+`load_hybrid_agent(checkpoint_directory)`. Base vocabulary resizing happens before
+adapter loading; both input and output anchor rows are restored by PEFT. The
+saved model retains vision weights from the base but does not train/use them.
+
+Do not use the hybrid engine to judge format-only checkpoints yet: HybridLink is
+still untrained. Evaluate format learning with ordinary text generation so the
+model writes the text inside `<latent>...</latent>`; later activation and
+self-conditioning are separate work.

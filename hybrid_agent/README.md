@@ -64,7 +64,8 @@ notebook used 5.13.0). Image/video inputs are not supported by the hybrid engine
 Use `batch_size=1` / `--num_samples 1`. Batched paused-row state handling and
 HybridRL are deliberately rejected until mixed-state continuation and replay
 agreement are validated. This does not make the original full-parameter SFT
-pipeline fit on a single GPU; no LoRA training has been added.
+pipeline fit on a single GPU. Optional single-process LoRA format activation is
+ documented in `hybrid_sft/README.md`; later LoRA training stages are not supported.
 
 Training and inference share an explicit `enable_thinking=True` prompt builder.
 Unsupported template endings fail rather than silently skipping every sample.
@@ -79,7 +80,8 @@ notebook `.pt` dictionaries are not directly loadable HybridAgent checkpoints.
 Legacy `adapter_config.json` HybridLink checkpoints remain readable through a
 temporary symlink view that excludes the conflicting config from PEFT detection.
 Original checkpoint files are never renamed. Genuine PEFT configs are not hidden;
-this change does not itself add LoRA checkpoint support.
+LoRA checkpoints use a separate `lora/` directory and a root `hybrid_lora.json`
+manifest, not the legacy HybridLink config.
 
 Run regression checks from the repository root:
 
