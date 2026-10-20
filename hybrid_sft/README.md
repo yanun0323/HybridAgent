@@ -379,6 +379,32 @@ hashes and the fixed interpolation rule's fractions. This remains a known-prefix
 known-length, forced-exit diagnostic, not autonomous generation. Its sequential
 cached execution differs from the full-prefix next-token CE probe.
 
+To isolate the third content input at the **fixed 10% update**, use the
+`third-input` suite with the same source arguments:
+
+```bash
+python -u scripts/latent_diagnostic.py --directory /content/latent-pilot \
+  --model /content/qwen-link-64 --reference /content/format-pilot/checkpoint \
+  --joint-run /content/qwen-link-joint-8 \
+  --step-size-run /content/qwen-link-step-size --suite third-input \
+  --output /content/latent-pilot/diagnostic-third-input-10pct.jsonl
+```
+
+This suite runs only fraction `0.1`, on the same first two development questions.
+Its four fresh-cache conditions are `teacher` (no replacements), `first-2`
+(replace positions 0 and 1), `third-only` (replace position 2), and `first-3`
+(replace positions 0, 1 and 2). All later content inputs are correct reference
+embeddings. Step 3 measures the prediction **after** those three inputs, before
+feeding the fourth. The summary includes the first six steps and replacement
+positions, as well as exit metrics and the forced-exit continuation. Comparing
+`first-2` to `first-3`, and `teacher` to `third-only`, tests the third input under
+predicted versus correct preceding inputs. Each predicted vector is recomputed
+from its own condition's hidden state; it is not a fixed vector transplanted
+across contexts. Results cannot alone prove a context-independent defect in the
+third vector or establish autonomous reasoning. No baseline fraction is rerun,
+so `teacher_controls_identical` is null (no cross-fraction check), not true.
+No training or model export occurs; checkpoint/scale checks are unchanged.
+
 For a direction-versus-magnitude diagnostic, use a new output file and
 `--suite direction-size` on the same checkpoint and two development questions:
 

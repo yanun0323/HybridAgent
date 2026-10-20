@@ -32,6 +32,19 @@ class DiagnosticPlanTests(unittest.TestCase):
             diagnostic.replacement_count("unknown", 10)
 
 
+    def test_third_input_plan_has_four_fixed_masks_and_only_ten_percent(self):
+        self.assertEqual(diagnostic.condition_names("third-input"),
+                         ("teacher", "first-2", "third-only", "first-3"))
+        expected = ((), (0, 1), (2,), (0, 1, 2))
+        for condition, positions in zip(diagnostic.condition_names("third-input"), expected):
+            self.assertEqual(diagnostic.replacement_positions(condition, 24), positions)
+            self.assertEqual(diagnostic.replacement_count(condition, 24), len(positions))
+        self.assertEqual(diagnostic.diagnostic_fractions("third-input"), (.1,))
+        self.assertEqual(diagnostic.diagnostic_fractions("substitution"), (0., .1))
+        with self.assertRaisesRegex(ValueError, "three"):
+            diagnostic.replacement_positions("third-only", 2)
+
+
 class PairedDiagnosticTests(unittest.TestCase):
     def test_teacher_replay_ignores_link_metrics_but_rejects_behavior_changes(self):
         import copy
@@ -148,7 +161,8 @@ class DiagnosticRuntimeTests(unittest.TestCase):
                 return ",".join(map(str, ids))
         sample = {"input_ids": [2, 3, 9, 6, 2, 4, 5, 7, 8, 10, 3, 11, 1], "prompt_len": 3}
         for condition, count in (("teacher", 0), ("first-1", 1), ("first-4", 4), ("all", 5),
-                                 ("pred-direction", 5), ("target-direction", 5)):
+                                 ("pred-direction", 5), ("target-direction", 5),
+                                 ("first-2", 2), ("third-only", 1), ("first-3", 3)):
             with self.subTest(condition=condition):
                 calls, cache = [], None
                 def forward(backbone, **kwargs):
@@ -176,7 +190,11 @@ class DiagnosticRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(calls), 9)
                 for i, token in enumerate((4, 5, 7, 8, 10)):
                     target = embedding.weight[token]
-                    expected = torch.full((4,), -7.0) if i < count else target
+                    substituted = i == 2 if condition == "third-only" else i < count
+                    expected = torch.full((4,), -7.0) if substituted else target
+                    self.assertEqual(result["steps"][i]["fed"], condition if condition in
+                                     ("pred-direction", "target-direction") else
+                                     "predicted" if substituted else "teacher")
                     if condition == "pred-direction":
                         expected = -torch.ones(4) * target.square().mean().sqrt()
                     elif condition == "target-direction":
@@ -186,6 +204,7 @@ class DiagnosticRuntimeTests(unittest.TestCase):
                     self.assertAlmostEqual(result["steps"][i]["fed_rms"], actual.square().mean().sqrt().item())
                 torch.testing.assert_close(calls[7][0, 0], embedding.weight[3])
                 self.assertEqual(result["replaced_tokens"], count)
+                self.assertEqual(result["replacement_positions"], [2] if condition == "third-only" else list(range(count)))
                 self.assertEqual(result["steps"][-1]["target_id"], 3)
                 self.assertEqual(result["steps"][-1]["fed"], "stop-before-exit")
                 self.assertEqual(result["steps"][-1]["exit_rank"], 1)

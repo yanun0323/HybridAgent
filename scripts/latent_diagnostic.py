@@ -26,16 +26,26 @@ def span_bounds(sample, entry, exit):
     return start, end
 
 
-def replacement_count(condition, length):
+def replacement_positions(condition, length):
     if condition == "teacher":
-        return 0
-    if condition == "first-1":
-        return min(1, length)
-    if condition == "first-4":
-        return min(4, length)
+        return ()
+    if condition in ("first-1", "first-2", "first-3", "first-4"):
+        return tuple(range(min(int(condition[-1]), length)))
+    if condition == "third-only":
+        if length < 3:
+            raise ValueError("third-input diagnostic requires at least three content inputs")
+        return (2,)
     if condition in ("all", "pred-direction", "target-direction"):
-        return length
+        return tuple(range(length))
     raise ValueError("unknown substitution condition")
+
+
+def replacement_count(condition, length):
+    return len(replacement_positions(condition, length))
+
+
+def diagnostic_fractions(suite):
+    return (.1,) if suite == "third-input" else (0., .1)
 
 
 def mixed_vector(prediction, target, condition):
@@ -69,6 +79,8 @@ def condition_names(suite):
         return ("teacher", "first-1", "first-4", "all")
     if suite == "direction-size":
         return ("teacher", "all", "pred-direction", "target-direction")
+    if suite == "third-input":
+        return ("teacher", "first-2", "third-only", "first-3")
     raise ValueError("unknown diagnostic suite")
 
 
@@ -82,7 +94,7 @@ def run_condition(model, tokenizer, sample, entry, exit, condition):
     start, end = span_bounds(sample, entry, exit)
     ids = sample["input_ids"]
     length = end - start - 1
-    replace = replacement_count(condition, length)
+    replace = replacement_positions(condition, length)
     # Rebuild a fresh cache for every condition, always using identical segmentation:
     # one prompt prefill, then one embedding per assistant token, including entry.
     prompt_len = sample["prompt_len"]
@@ -130,10 +142,10 @@ def run_condition(model, tokenizer, sample, entry, exit, condition):
             "cosine": F.cosine_similarity(p, t, dim=0).item(),
             "prediction_rms": p.square().mean().sqrt().item(),
             "target_rms": t.square().mean().sqrt().item(),
-            "fed": "stop-before-exit" if step == length else ("predicted" if step < replace else "teacher"),
+            "fed": "stop-before-exit" if step == length else ("predicted" if step in replace else "teacher"),
         }
         if step < length:
-            vector = prediction if step < replace else target_embed
+            vector = prediction if step in replace else target_embed
             if condition in ("pred-direction", "target-direction"):
                 vector = mixed_vector(prediction, target_embed, condition)
                 step_result["fed"] = condition
@@ -163,7 +175,7 @@ def run_condition(model, tokenizer, sample, entry, exit, condition):
         if i < 95:
             feed(embedding(token))
     return {"condition": condition, "reference_latent_tokens": length,
-            "replaced_tokens": replace, "steps": steps,
+            "replaced_tokens": len(replace), "replacement_positions": list(replace), "steps": steps,
             "continuation_after_forced_exit": tokenizer.decode(continuation, skip_special_tokens=False),
             "continuation_end_reason": reason,
             "expected_text_continuation": tokenizer.decode(ids[end + 1:-1], skip_special_tokens=False)}
@@ -224,14 +236,16 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--reference", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--suite", choices=("substitution", "direction-size"), default="substitution")
-    parser.add_argument("--joint-run", help="paired mode: original joint run, fixed fractions 0 and 0.1")
+    parser.add_argument("--suite", choices=("substitution", "direction-size", "third-input"), default="substitution")
+    parser.add_argument("--joint-run", help="original joint run; substitution uses 0 and 0.1, third-input uses only 0.1")
     parser.add_argument("--step-size-run", help="completed fixed-fraction probe, required with --joint-run")
     args = parser.parse_args()
     if bool(args.joint_run) != bool(args.step_size_run):
         parser.error("--joint-run and --step-size-run must be supplied together")
-    if args.joint_run and args.suite != "substitution":
-        parser.error("paired mode uses the fixed substitution suite")
+    if args.joint_run and args.suite == "direction-size":
+        parser.error("joint-run mode does not support direction-size")
+    if args.suite == "third-input" and not args.joint_run:
+        parser.error("third-input requires --joint-run and --step-size-run; fixed fraction 0.1")
     path, manifest = verify_data(args.directory, "latent-dev")
     output = Path(args.output)
     if output.exists() or output.with_suffix(".summary.json").exists():
@@ -266,8 +280,8 @@ def main():
         del a, b
         before = torch.load(source / "adapter.pt", map_location="cpu", weights_only=True)
         after = torch.load(joint / "checkpoint/adapter.pt", map_location="cpu", weights_only=True)
-        pair_states = ((0., interpolate_state(before, after, 0.)),
-                       (.1, interpolate_state(before, after, .1)))
+        pair_states = tuple((f, interpolate_state(before, after, f))
+                            for f in diagnostic_fractions(args.suite))
         del before, after
     if not torch.cuda.is_available():
         raise RuntimeError("run the 27B diagnostic on the target GPU")
@@ -290,9 +304,13 @@ def main():
                 sample = tokenize_trajectory(tokenizer, row["system"], row["question"], reference["rounds"], 1024)
                 if sample is None:
                     raise ValueError("reference trajectory rejected")
+                if args.suite == "third-input":
+                    start, end = span_bounds(sample, entry, exit)
+                    if end - start - 1 < 3:
+                        raise ValueError("third-input requires three content inputs")
                 for condition in condition_names(args.suite):
                     result = run_condition(model, tokenizer, sample, entry, exit, condition)
-                    if pair_states is not None and condition == "teacher":
+                    if pair_states is not None and len(pair_states) == 2 and condition == "teacher":
                         if fraction == 0.:
                             teachers[row["id"]] = result
                         else:
@@ -304,6 +322,7 @@ def main():
                     stream.flush()
                     summaries.append({k: v for k, v in item.items() if k != "steps"} | {
                         "first_step": result["steps"][0], "exit_step": result["steps"][-1],
+                        "initial_steps": result["steps"][:6],
                         "early_exit_steps": [s["step"] for s in result["steps"][:-1] if s["exit_argmax"]],
                         "reference_mismatch_steps": [s["step"] for s in result["steps"]
                                                      if s["predicted_id"] != s["target_id"]],
@@ -321,9 +340,17 @@ def main():
                    "All conditions use the same sequential cache segmentation. "
                    "Continuation is ordinary text, including any emitted latent tags; NOT autonomous latent reasoning."}
     if pair_states is not None:
-        summary["paired_update"] = {"fractions": [0., .1], "joint_run": args.joint_run,
-                                    "provenance": pair_provenance, "teacher_controls_identical": True,
+        summary["paired_update"] = {"fractions": list(diagnostic_fractions(args.suite)), "joint_run": args.joint_run,
+                                    "provenance": pair_provenance,
+                                    "teacher_controls_identical": True if len(pair_states) == 2 else None,
                                     "weights_saved": False}
+    if args.suite == "third-input":
+        summary["third_input_control"] = {
+            "measurement_step": 3,
+            "note": "Step 3 is measured after feeding three content inputs. Only steps 0, 1, 2 "
+                    "may be predicted; all later inputs are teacher embeddings. Each prediction "
+                    "uses that condition's current hidden state, not a vector copied from another run. "
+                    "This separates input policies, not a context-independent defect in one vector."}
     write_json(output.with_suffix(".summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
