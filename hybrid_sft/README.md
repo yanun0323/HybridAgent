@@ -491,3 +491,27 @@ difference test. Smaller fractions lowering training CE would support overshooti
 on this local update, not prove generalization or recursive latent success. BF16
 input quantization can hide small parameter changes. Observation rows remain
 training-set observations, not held-out evaluation.
+
+After completing that probe, the same script can check the remaining 48 training
+records at the **fixed** fraction `0.1` versus `0`, with no further fraction search:
+
+```bash
+python -u scripts/link_step_size.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 --joint-run /content/qwen-link-joint-8 \
+  --remaining-train --step-size-run /content/qwen-link-step-size \
+  --output-dir /content/qwen-link-remaining-48
+```
+
+This mode requires exactly 64 unique training IDs and selects records 17–64 in
+file order. It verifies data, source/updated link, and joint-run hashes against
+the completed step-size probe. For each fraction it first replays the original
+16 control records against that probe's saved per-record CE; a mismatch stops
+execution before measuring the remaining 48 at that fraction. Both fractions
+use the same grad-enabled forward path, with no backward or optimizer.
+
+`summary.json` keeps `update`, `observation`, and `remaining_train` separate for
+each fraction, including each record's CE and counts of improvements/regressions.
+All measurements stream to `measurements.jsonl`. No model is selected or saved.
+These 48 records did not participate in the eight-record joint update, but they
+were used in earlier training: they are not a held-out test or evidence of
+recursive-generation success. The reserved test remains unopened.

@@ -53,15 +53,49 @@ def verify_endpoint(rows, measurements, saved_rows, field):
     return largest_error
 
 
+def remaining_plan(rows, run, prior_run, prior_summary, hashes):
+    """Fixed 48-row extension, anchored to the completed 16-row probe."""
+    if len(rows) != 64 or len({r["id"] for r in rows}) != 64:
+        raise ValueError("expected exactly 64 unique training records")
+    for key, value in hashes.items():
+        if prior_run[key] != value:
+            raise ValueError(f"step-size provenance mismatch: {key}")
+    for key in ("update_ids", "observation_ids"):
+        if prior_run[key] != run[key]:
+            raise ValueError(f"step-size selection mismatch: {key}")
+    if prior_run["scale"] != run["calibration"]["output_scale"]:
+        raise ValueError("step-size scale changed")
+    if prior_run["fractions_in_execution_order"] != list(FRACTIONS):
+        raise ValueError("expected the original fixed-fraction probe")
+    references = {}
+    for fraction in (0.0, 0.1):
+        matches = [r for r in prior_summary["results"] if r["fraction"] == fraction]
+        if len(matches) != 1:
+            raise ValueError("missing or duplicate fixed-fraction reference")
+        saved = matches[0]["update"]["rows"] + matches[0]["observation"]["rows"]
+        if [r["id"] for r in saved] != [r["id"] for r in rows[:16]]:
+            raise ValueError("step-size reference IDs differ")
+        references[fraction] = saved
+    return rows[16:], references
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pilot", required=True)
     parser.add_argument("--model", required=True, help="original 64-step checkpoint")
     parser.add_argument("--joint-run", required=True, help="joint run containing run.json, summary.json and checkpoint/")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--remaining-train", action="store_true",
+                        help="compare only 0 and 0.1 on remaining 48 training rows; replay first 16 as controls")
+    parser.add_argument("--step-size-run", help="completed original step-size probe; required with --remaining-train")
     args = parser.parse_args()
+    if args.remaining_train != bool(args.step_size_run):
+        parser.error("--remaining-train and --step-size-run must be supplied together")
     source, joint, output = (Path(v).resolve() for v in (args.model, args.joint_run, args.output_dir))
-    for protected in (source, joint, Path(args.pilot).resolve()):
+    protected_paths = [source, joint, Path(args.pilot).resolve()]
+    if args.step_size_run:
+        protected_paths.append(Path(args.step_size_run).resolve())
+    for protected in protected_paths:
         if output == protected or output in protected.parents or protected in output.parents:
             raise ValueError("output must be separate from checkpoints and data")
     if output.exists():
@@ -89,6 +123,21 @@ def main():
         if [r["id"] for r in selected] != run[key]:
             raise ValueError("joint selection changed")
     selected = update_rows + observe_rows
+    fractions, remaining_rows, references = FRACTIONS, [], {}
+    prior_hashes = {}
+    if args.remaining_train:
+        prior = Path(args.step_size_run).resolve()
+        prior_run = json.loads((prior / "run.json").read_text())
+        prior_summary = json.loads((prior / "summary.json").read_text())
+        hashes = {"source_link_sha256": sha256(source / "adapter.pt"),
+                  "updated_link_sha256": sha256(updated / "adapter.pt"),
+                  "joint_run_sha256": sha256(joint / "run.json"),
+                  "joint_summary_sha256": sha256(joint / "summary.json"), "data_sha256": sha256(data)}
+        remaining_rows, references = remaining_plan(rows, run, prior_run, prior_summary, hashes)
+        prior_hashes = {"step_size_run_sha256": sha256(prior / "run.json"),
+                        "step_size_summary_sha256": sha256(prior / "summary.json")}
+        fractions = (0.0, 0.1)
+        selected += remaining_rows
 
     import torch
     from accelerate import Accelerator
@@ -126,7 +175,9 @@ def main():
         batches.append(collate_batch(tokenizer, [sample]))
     output.mkdir(parents=True)
     write_json(output / "run.json", {
-        "source": str(source), "joint_run": str(joint), "fractions_in_execution_order": FRACTIONS,
+        "source": str(source), "joint_run": str(joint), "fractions_in_execution_order": fractions,
+        "remaining_train": args.remaining_train, "remaining_ids": [r["id"] for r in remaining_rows],
+        **prior_hashes,
         "source_link_sha256": sha256(source / "adapter.pt"), "updated_link_sha256": sha256(updated / "adapter.pt"),
         "joint_run_sha256": sha256(joint / "run.json"), "joint_summary_sha256": sha256(joint / "summary.json"),
         "data_sha256": sha256(data), "scale": scale, "torch": torch.__version__,
@@ -147,7 +198,7 @@ def main():
     results, endpoints = [], {}
     baseline = None
     with (output / "measurements.jsonl").open("x", encoding="utf-8") as stream:
-        for fraction in FRACTIONS:
+        for fraction in fractions:
             state = interpolate_state(before, after, fraction)
             raw.hybridlink.load_state_dict(state, strict=True)
             del state
@@ -164,7 +215,11 @@ def main():
                 measured.append(item)
                 stream.write(json.dumps({"fraction": fraction, "id": row["id"], **item}) + "\n")
                 stream.flush()
-            if fraction in (0, 1):
+                if args.remaining_train and len(measured) == 16:
+                    error = verify_endpoint(selected[:16], measured, references[fraction], "after_ce")
+                    endpoints[str(fraction)] = error
+                    print(f"First 16 controls at {fraction} verified; max CE difference={error:.8g}", flush=True)
+            if not args.remaining_train and fraction in (0, 1):
                 field = "before_ce" if fraction == 0 else "after_ce"
                 saved = previous["update"]["rows"] + previous["observation"]["rows"]
                 endpoints[str(fraction)] = verify_endpoint(selected, measured, saved, field)
@@ -173,14 +228,18 @@ def main():
                 baseline = measured
             result = {"fraction": fraction,
                       "update": comparison(update_rows, baseline[:8], measured[:8]),
-                      "observation": comparison(observe_rows, baseline[8:], measured[8:])}
+                      "observation": comparison(observe_rows, baseline[8:16], measured[8:16])}
+            if args.remaining_train:
+                result["remaining_train"] = comparison(remaining_rows, baseline[16:], measured[16:])
+                print(f"fraction={fraction} remaining_train_mean={result['remaining_train']['mean_after_ce']:.8g}", flush=True)
             results.append(result)
             print(f"fraction={fraction} update_mean={result['update']['mean_after_ce']:.8g} "
                   f"observation_mean={result['observation']['mean_after_ce']:.8g}", flush=True)
     summary = {"endpoint_max_ce_difference": endpoints, "results": results,
                "warning": "Fixed fractions of saved AdamW displacement, not a gradient check or new training. "
                           "Training-set first-position CE only. No checkpoint selected or saved; "
-                          "BF16 quantization can hide very small changes."}
+                          "BF16 quantization can hide very small changes. "
+                          "Remaining rows are also prior training data, not held-out generalization."}
     write_json(output / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

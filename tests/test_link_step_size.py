@@ -33,6 +33,58 @@ class EndpointTests(unittest.TestCase):
         self.assertGreater(probe.verify_endpoint(rows, near, saved, "before_ce"), 0)
 
 
+class RemainingTrainTests(unittest.TestCase):
+    def inputs(self):
+        rows = [{"id": str(i), "question": f"q{i}"} for i in range(64)]
+        run = {"update_ids": [r["id"] for r in rows[:8]],
+               "observation_ids": [r["id"] for r in rows[8:16]],
+               "calibration": {"output_scale": .012}}
+        hashes = {"source_link_sha256": "a", "updated_link_sha256": "b",
+                  "data_sha256": "c", "joint_run_sha256": "d", "joint_summary_sha256": "e"}
+        prior = {**hashes, "update_ids": run["update_ids"], "observation_ids": run["observation_ids"],
+                 "scale": .012, "fractions_in_execution_order": list(probe.FRACTIONS)}
+        summary = {"results": [{"fraction": f, "update": {"rows": rows[:8]},
+                                "observation": {"rows": rows[8:16]}} for f in probe.FRACTIONS]}
+        return rows, run, prior, summary, hashes
+
+    def test_fixed_remaining_rows_and_separate_reporting(self):
+        rows, run, prior, summary, hashes = self.inputs()
+        remaining, references = probe.remaining_plan(rows, run, prior, summary, hashes)
+        self.assertEqual(remaining, rows[16:])
+        self.assertEqual(len(remaining), 48)
+        self.assertFalse({r["id"] for r in remaining} & set(run["update_ids"] + run["observation_ids"]))
+        self.assertEqual(set(references), {0., .1})
+        self.assertEqual(references[.1], rows[:16])
+        meta = {"target_id": 15, "target_position": 124, "substitution_position": 123}
+        before = [{**meta, "ce": 1.} for _ in remaining]
+        after = [{**meta, "ce": 0. if i < 24 else 2.} for i in range(48)]
+        report = probe.comparison(remaining, before, after)
+        self.assertEqual((report["lower_ce"], report["higher_ce"]), (24, 24))
+        self.assertEqual([r["id"] for r in report["rows"]], [r["id"] for r in remaining])
+
+    def test_rejects_changed_data_weights_selection_and_reference(self):
+        import copy
+        rows, run, prior, summary, hashes = self.inputs()
+        for bad_rows in (rows[:63], rows + [rows[0]], rows[:63] + [rows[0]]):
+            with self.assertRaisesRegex(ValueError, "64 unique"):
+                probe.remaining_plan(bad_rows, run, prior, summary, hashes)
+        for key in hashes:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "provenance"):
+                probe.remaining_plan(rows, run, {**prior, key: "changed"}, summary, hashes)
+        for key, value in (("scale", .02), ("update_ids", []), ("observation_ids", []),
+                           ("fractions_in_execution_order", [0., .1])):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                probe.remaining_plan(rows, run, {**prior, key: value}, summary, hashes)
+        for bad in ({"results": summary["results"][:-1]},
+                    {"results": summary["results"] + [summary["results"][-1]]}):
+            with self.assertRaisesRegex(ValueError, "missing or duplicate"):
+                probe.remaining_plan(rows, run, prior, bad, hashes)
+        bad = copy.deepcopy(summary)
+        bad["results"][-1]["observation"]["rows"][0]["id"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "IDs differ"):
+            probe.remaining_plan(rows, run, prior, bad, hashes)
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
 class InterpolationTests(unittest.TestCase):
     def test_exact_endpoints_fractions_no_alias_or_mutation(self):
