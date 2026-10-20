@@ -1,4 +1,4 @@
-"""Compare three-input execution paths on eight fixed training records. No backward."""
+"""Compare three/six-input execution paths on eight fixed training records. No backward."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from format_experiment import ROOT, verify_data, sha256, write_json
@@ -15,7 +16,7 @@ from link_three_step_probe import select_record
 from latent_diagnostic import span_bounds
 
 
-def cached_rollout(model, sample, entry_id, exit_id):
+def cached_rollout(model, sample, entry_id, exit_id, link_steps=3):
     """Same segmentation as latent_diagnostic: prompt, assistant tokens, vectors.
 
     Caller supplies no_grad and BF16 autocast. The head/decoder are the same ones
@@ -24,9 +25,11 @@ def cached_rollout(model, sample, entry_id, exit_id):
     import torch
     import torch.nn.functional as F
     from hybrid_agent.compat import text_decoder
+    if link_steps not in (3, 6):
+        raise ValueError('link_steps must be 3 or 6')
     start, end = span_bounds(sample, entry_id, exit_id)
-    if end - start - 1 < 3:
-        raise ValueError('requires at least three reference content tokens')
+    if end - start - 1 < link_steps:
+        raise ValueError(f'requires at least {link_steps} reference content tokens')
     device = next(model.backbone.parameters()).device
     ids = sample['input_ids']
     prompt_len = sample['prompt_len']
@@ -51,7 +54,7 @@ def cached_rollout(model, sample, entry_id, exit_id):
         feed(embed(torch.tensor([[token]], device=device)))
     vectors, losses, predicted = [], [], []
     dtype = embed.weight.dtype
-    for step in range(3):
+    for step in range(link_steps):
         with torch.autocast(device_type=device.type, enabled=False):
             vector = model.run_hybridlink(out.last_hidden_state[:, -1:], output_dtype=torch.float32)
         vectors.append(vector)
@@ -62,9 +65,9 @@ def cached_rollout(model, sample, entry_id, exit_id):
     losses = torch.stack(losses)
     return {'loss': losses.mean(), 'step_losses': losses, 'rollout_vectors': tuple(vectors),
             'predicted_ids': torch.stack(predicted, dim=1),
-            'target_ids': torch.tensor([ids[start + 2:start + 5]], device=device),
-            'substitution_positions': list(range(start + 1, start + 4)),
-            'target_positions': list(range(start + 2, start + 5))}
+            'target_ids': torch.tensor([ids[start + 2:start + link_steps + 2]], device=device),
+            'substitution_positions': list(range(start + 1, start + link_steps + 1)),
+            'target_positions': list(range(start + 2, start + link_steps + 2))}
 
 
 def measurements(out, tokenizer):
@@ -77,7 +80,10 @@ def measurements(out, tokenizer):
     target = out['target_ids'].tolist()[0]
     predicted = out['predicted_ids'].tolist()[0]
     ce = out['step_losses'].detach().tolist()
-    return {'mean_ce': sum(ce) / 3, 'step_ce': ce,
+    if len(ce) not in (3, 6) or any(len(v) != len(ce) for v in
+            (target, predicted, vectors, out['substitution_positions'], out['target_positions'])):
+        raise ValueError('expected matching three- or six-position measurements')
+    return {'mean_ce': sum(ce) / len(ce), 'step_ce': ce,
             'target_probabilities': [math.exp(-v) for v in ce],
             'target_ids': target, 'predicted_ids': predicted,
             'target_texts': [tokenizer.decode([v]) for v in target],
@@ -91,10 +97,37 @@ def compare_paths(a, b, av, bv):
     for key in ('target_ids', 'target_positions', 'substitution_positions'):
         if a[key] != b[key]:
             raise ValueError('execution paths target different positions')
+    count = len(a['target_ids'])
+    if count not in (3, 6) or any(len(v) != count for v in
+            (a['step_ce'], b['step_ce'], a['predicted_ids'], b['predicted_ids'], av, bv)):
+        raise ValueError('execution path lengths differ')
     return {'delta_ce_b_minus_a': [y - x for x, y in zip(a['step_ce'], b['step_ce'])],
             'argmax_matches': [x == y for x, y in zip(a['predicted_ids'], b['predicted_ids'])],
             'vector_cosines': [F.cosine_similarity(x.flatten(), y.flatten(), dim=0).item() for x, y in zip(av, bv)],
             'vector_max_abs_differences': [(x - y).abs().max().item() for x, y in zip(av, bv)]}
+
+
+def path_totals(results, link_steps):
+    """Keep first-failure positions separate from averages; positions count from 1."""
+    if not results or link_steps not in (3, 6):
+        raise ValueError('requires records and three or six positions')
+    totals = {}
+    for path in ('full_grad', 'full_no_grad', 'cached_no_grad'):
+        metrics = [r[path] for r in results]
+        if any(len(m[key]) != link_steps for m in metrics
+               for key in ('step_ce', 'target_ids', 'predicted_ids')):
+            raise ValueError('execution path lengths differ')
+        correct = [[a == b for a, b in zip(m['predicted_ids'], m['target_ids'])] for m in metrics]
+        totals[path] = {
+            'mean_step_ce': [sum(m['step_ce'][i] for m in metrics) / len(metrics)
+                             for i in range(link_steps)],
+            'correct_by_step': [sum(c[i] for c in correct) for i in range(link_steps)],
+            'all_steps_correct': sum(all(c) for c in correct),
+            'first_mismatch_by_record': [
+                {'id': r['id'], 'step': next((i + 1 for i, ok in enumerate(c) if not ok), None)}
+                for r, c in zip(results, correct)],
+        }
+    return totals
 
 
 def main():
@@ -103,6 +136,7 @@ def main():
     p.add_argument('--model', required=True)
     p.add_argument('--calibration', required=True)
     p.add_argument('--output-dir', required=True)
+    p.add_argument('--link-steps', type=int, choices=(3, 6), default=3)
     args = p.parse_args()
     source, output = Path(args.model).resolve(), Path(args.output_dir).resolve()
     for protected in (source, Path(args.pilot).resolve()):
@@ -148,8 +182,8 @@ def main():
         if sample is None:
             raise ValueError(f'rejected record {row["id"]}')
         start, end = span_bounds(sample, entry, exit)
-        if end - start - 1 < 3:
-            raise ValueError('requires three content tokens')
+        if end - start - 1 < args.link_steps:
+            raise ValueError(f'requires {args.link_steps} content tokens')
         samples.append(sample)
     hashes = {name: sha256(source / name) for name in ('adapter.pt', 'lora/adapter_model.safetensors')}
     output.mkdir(parents=True)
@@ -158,6 +192,7 @@ def main():
         'sample_ids': [r['id'] for r in rows],
         'input_ids_sha256': [hashlib.sha256(json.dumps(s['input_ids']).encode()).hexdigest() for s in samples],
         'calibration': calibration, 'seed': 6064, 'torch': torch.__version__,
+        'link_steps': args.link_steps, 'optimizer_steps': 0,
         'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'paths': ['full_grad', 'full_no_grad', 'cached_no_grad'],
         'precision': 'BF16 autocast in all paths; FP32 HybridLink, cast to embedding dtype',
@@ -173,19 +208,20 @@ def main():
     raw = accelerator.unwrap_model(model)
     versions = {n: p._version for n, p in raw.named_parameters()}
     torch.cuda.reset_peak_memory_stats()
+    started = time.monotonic()
     results = []
     with (output / 'measurements.jsonl').open('x') as stream:
         for row, sample in zip(rows, samples):
             batch = {k: v.to(accelerator.device) for k, v in collate_batch(tokenizer, [sample]).items()}
-            out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=3)
+            out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=args.link_steps)
             full, fv = measurements(out, tokenizer)
             del out  # discard graph BEFORE the next path, never backward
             with torch.no_grad():
-                out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=3)
+                out = model(**batch, stage=LINK_NEXT_TOKEN, link_steps=args.link_steps)
                 plain, pv = measurements(out, tokenizer)
                 del out
                 with accelerator.autocast():
-                    out = cached_rollout(raw, sample, entry, exit)
+                    out = cached_rollout(raw, sample, entry, exit, link_steps=args.link_steps)
                 cached, cv = measurements(out, tokenizer)
                 del out  # fresh cache for the next record
             item = {'id': row['id'], 'question': row['question'],
@@ -200,7 +236,10 @@ def main():
         raise RuntimeError('parameters changed or accumulated gradients')
     if any(sha256(source / name) != value for name, value in hashes.items()):
         raise RuntimeError('source checkpoint changed')
-    summary = {'count': len(results), 'results': results,
+    summary = {'count': len(results), 'link_steps': args.link_steps, 'results': results,
+               'by_path': path_totals(results, args.link_steps),
+               'step_numbering': '1-based: step k is measured after k predicted inputs',
+               'elapsed_seconds': time.monotonic() - started,
                'mean_ce_by_path': {name: sum(r[name]['mean_ce'] for r in results) / len(results)
                                    for name in ('full_grad', 'full_no_grad', 'cached_no_grad')},
                'peak_gpu_gib': torch.cuda.max_memory_allocated() / 1024**3,

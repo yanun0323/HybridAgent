@@ -641,7 +641,7 @@ output and log rather than retrying with changed settings in place.
 
 ### Compare full-prefix and cached execution
 
-Before interpreting three-input CE as evidence about cached inference, compare
+Before interpreting three- or six-input CE as evidence about cached inference, compare
 both paths on the **first eight training records**, original 64-step weights:
 
 ```bash
@@ -652,10 +652,10 @@ python -u scripts/link_execution_probe.py --pilot /content/format-pilot \
 ```
 
 The backbone is loaded once. Each record runs `full_grad` through the actual
-three-input objective (graph discarded, no backward), then `full_no_grad` through
+selected-length objective (graph discarded, no backward), then `full_no_grad` through
 the same objective, then `cached_no_grad`. The cached path prefills only the prompt,
-feeds assistant prefix tokens one by one through the entry, then feeds three
-recursive link predictions with explicit positions and a fresh cache. No known
+feeds assistant prefix tokens one by one through the entry, then feeds the selected
+number of recursive link predictions with explicit positions and a fresh cache. No known
 latent-content embedding is fed. All paths use BF16 autocast and FP32 HybridLink
 with outputs cast to embedding dtype. This holds precision and decoder/head access
 constant; the cached segmentation matches the development diagnostic, but this is
@@ -665,11 +665,34 @@ not an exact replay of its older inference-mode/no-autocast environment.
 `cache_segmentation_comparison` compares the two no-grad paths. Each path generates
 its own vectors, so later differences can include feedback from earlier differences,
 not just a single decoder-call difference. JSONL and summary retain each record's
-three CE values, probabilities, argmax IDs/text, target positions, and cross-path
+three or six CE values, probabilities, argmax IDs/text, target positions, and cross-path
 vector cosine/max-absolute differences. No threshold chooses a winning path or
 updates weights. The source files, parameter versions and absence of gradients are
 checked after measurement. No development or test data is opened. An observed
 mismatch does not by itself identify a kernel bug or establish reasoning ability.
+
+For the six-input comparison, keep the original source and first eight records:
+
+```bash
+python -u scripts/link_execution_probe.py --link-steps 6 \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-six-step-execution-8
+```
+
+The default remains three inputs, including callers from existing joint-update and
+remaining-record scripts. Six-input mode measures all 48 positions on all three
+paths, without backward, an optimizer or model export. `run.json` records length,
+IDs, input/source hashes and execution settings before loading weights. Measurements
+stream to `measurements.jsonl`. The summary includes each path's per-position mean
+CE and correct counts, all-position-correct count, and each record's first wrong
+position (`null` if none). These positions count from 1: position k is measured
+after k predicted inputs. The elapsed time excludes model loading; peak memory
+covers the three execution paths. No path is required to match or chosen as a
+winner; every discrepancy is retained. Tiny-model tests cover both lengths, fresh
+cache segmentation, target alignment, no reference-content leakage, mean CE over
+the actual number of positions, and full/cached agreement on an attention-only
+control. That control does not establish equality for the 27B Qwen model.
 
 ### One eight-record three-input update
 
