@@ -99,6 +99,8 @@ class HybridAgentModel(nn.Module):
                     raise ValueError(f"unsupported HybridLink config {tag!r}")
             model.output_scale = checked_scale(link_config.get("output_scale", 1.0))
             state = torch.load(str(weights), map_location="cpu", weights_only=True)
+            # Preserve FP32 HybridLink updates even with a BF16 frozen backbone.
+            model.hybridlink.to(dtype=state["proj1.weight"].dtype)
             model.hybridlink.load_state_dict(state, strict=True)
         elif require_hybridlink:
             raise FileNotFoundError(f"{HYBRIDLINK_WEIGHTS} not found in {local}")

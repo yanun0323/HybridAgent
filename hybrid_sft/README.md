@@ -54,7 +54,9 @@ Every checkpoint directory (`checkpoint-N/` and the final output) is a complete 
 ## Experimental single-GPU LoRA format activation
 
 This is a resource-saving adaptation, not a reproduction of full-parameter
-HybridSFT. Only `format_activation` is supported; HybridLink stays frozen.
+HybridSFT. During `format_activation`, HybridLink stays frozen. A saved LoRA
+checkpoint can also initialize frozen `hybridlink_activation` (see below);
+LoRA self-conditioning and RL remain unsupported.
 PEFT LoRA targets text attention/DeltaNet/MLP projections, not vision layers.
 Only the `<latent>` and `</latent>` rows of the input embedding and untied output
 head are trainable; the complete vocabulary matrices are not optimizer parameters.
@@ -99,6 +101,48 @@ Do not use the hybrid engine to judge format-only checkpoints yet: HybridLink is
 still untrained. Evaluate format learning with ordinary text generation so the
 model writes the text inside `<latent>...</latent>`; later activation and
 self-conditioning are separate work.
+
+### Frozen HybridLink activation
+
+Use an existing format checkpoint **without** `--lora`. The backbone, existing
+LoRA and both anchor rows remain frozen and in evaluation mode; only HybridLink
+is optimized in FP32. This activation path currently requires one process without
+DeepSpeed; Qwen also requires batch size one. Do not overwrite or nest the output
+inside the source checkpoint. Start with one update:
+
+```bash
+python -u -m hybrid_sft.train --stage hybridlink_activation \
+  --model /content/format-pilot/checkpoint --data /content/format-pilot/train.jsonl \
+  --output_dir /content/qwen-link-smoke --calibrate_link_scale \
+  --hybridlink_lr 2e-4 --epochs 1 --batch_size 1 --grad_accum 1 --max_steps 1 \
+  --max_length 1024 --num_workers 0 --save_steps 0 --seed 6064
+```
+
+`--calibrate_link_scale` makes one pass over the supplied training dataset before
+optimization. It matches the RMS of unscaled HybridLink predictions to the RMS of
+next-token embeddings at latent sources, including exit-anchor targets. The scalar
+is then fixed; this is magnitude calibration, not learned reasoning or directional
+alignment. `link_calibration.json` records both RMS values, counts, scale and input
+file hash. Without the flag the checkpoint's existing scale is preserved. Never
+supply validation/test data for calibration. Its full pass is additional work even
+when `--max_steps 1` limits optimizer updates.
+
+Activation uses frozen teacher states with the real preceding tokens; it predicts
+only latent next-token embeddings and the exit-anchor embedding. Text CE is not
+computed on this path (`backbone_loss=0` means omitted, not perfect text accuracy).
+The first update checks finite nonzero HybridLink gradients and the absence of any
+backbone gradients. Logs include cosine and MSE losses. FP32 link weights remain
+FP32 when reloaded alongside a BF16 backbone. LoRA checkpoints save only the existing
+PEFT files, tokenizer, HybridLink and metadata, not a copy of the 27B backbone.
+
+The regression test `test_frozen_link_activation_calibration_and_checkpoint_roundtrip`
+uses a tiny local model to check target positions, frozen parameters, unchanged text
+logits, nonzero link updates, magnitude calibration, and checkpoint round-trip. Run
+it in the environment with torch/Transformers/PEFT before the real smoke test.
+Neither a passed smoke test nor declining regression loss demonstrates successful
+recursive latent generation. That requires a separate generation evaluation with
+natural versus forced exits counted separately. No optimizer resume, LoRA
+self-conditioning, new latent evaluation suite or speed claim is added here.
 
 ### Reproducible format pilot
 

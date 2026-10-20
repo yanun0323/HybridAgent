@@ -83,6 +83,109 @@ class LoraTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected)
             restored.save_pretrained(Path(temp) / "resaved", Tokenizer())
 
+    def test_frozen_link_activation_calibration_and_checkpoint_roundtrip(self):
+        import torch
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+        from hybrid_agent.model import HybridAgentModel
+        from hybrid_agent.lora import enable_format_lora
+        from hybrid_agent.compat import text_forward
+        from hybrid_sft.model import HybridSFTModel, HYBRIDLINK_ACTIVATION
+
+        class Tokenizer:
+            unk_token_id = None
+            def __len__(self):
+                return 34
+            def encode(self, text, **kwargs):
+                return [{"<latent>": 32, "</latent>": 33}[text]]
+            def save_pretrained(self, directory):
+                (Path(directory) / "test-tokenizer.txt").write_text("anchors=32,33")
+
+        torch.manual_seed(11)
+        config = Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                             num_hidden_layers=1, num_attention_heads=2,
+                             num_key_value_heads=1, head_dim=8, tie_word_embeddings=False)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            Qwen3ForCausalLM(config).save_pretrained(root / "base")
+            initial = HybridSFTModel.from_pretrained(root / "base", dtype=torch.float32)
+            enable_format_lora(initial, Tokenizer(), rank=2, alpha=4)
+            # Nonzero deltas ensure reloading preserves learned format parameters.
+            with torch.no_grad():
+                for p in initial.backbone.parameters():
+                    if p.requires_grad:
+                        p.add_(0.001)
+            initial.save_pretrained(root / "format", Tokenizer())
+            model = HybridSFTModel.from_pretrained(root / "format", dtype=torch.float32)
+            model.set_trainable(HYBRIDLINK_ACTIVATION)
+            model.train()
+            self.assertFalse(model.backbone.training)
+            self.assertTrue(model.hybridlink.training)
+            self.assertFalse(any(p.requires_grad for p in model.backbone.parameters()))
+            self.assertTrue(all(p.dtype == torch.float32 and p.requires_grad for p in model.hybridlink.parameters()))
+            ids = torch.tensor([[1, 32, 5, 7, 33, 6, 2]])
+            batch = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                     "latent_mask": torch.tensor([[0, 1, 1, 1, 0, 0, 0]])}
+            hidden, targets, exits = model._link_pairs(**batch)
+            with torch.no_grad():
+                embeddings = model.backbone.get_input_embeddings()(ids)
+            torch.testing.assert_close(targets, embeddings[:, 2:5].reshape(3, 16))
+            self.assertEqual(exits.tolist(), [False, False, True])
+            self.assertFalse(hidden.requires_grad)
+            self.assertFalse(targets.requires_grad)
+            # Padding cannot create an extra regression target, even if its latent mask is set.
+            padded = {k: torch.nn.functional.pad(v, (0, 2)) for k, v in batch.items()}
+            padded["latent_mask"][0, -2:] = 1
+            _, padded_targets, padded_exits = model._link_pairs(**padded)
+            torch.testing.assert_close(padded_targets, targets)
+            self.assertEqual(padded_exits.tolist(), exits.tolist())
+            report = model.calibrate_link_scale([batch])
+            self.assertEqual(report["pairs"], 3)
+            predicted = model.run_hybridlink(hidden)
+            torch.testing.assert_close(predicted.square().mean().sqrt(), targets.square().mean().sqrt())
+            before = {n: p.detach().clone() for n, p in model.backbone.named_parameters()}
+            link_before = {n: p.detach().clone() for n, p in model.hybridlink.named_parameters()}
+            with torch.no_grad():
+                logits_before = text_forward(model.backbone, input_ids=ids, return_dict=True).logits
+            optimizer = torch.optim.AdamW(model.hybridlink.parameters(), lr=1e-3)
+            from unittest.mock import patch
+            with patch.object(model, "_chunked_ce", side_effect=AssertionError("frozen text CE must be skipped")):
+                out = model(**batch, stage=HYBRIDLINK_ACTIVATION)
+            out["loss"].backward()
+            self.assertEqual(out["backbone_loss"].item(), 0)
+            self.assertTrue(torch.isfinite(out["loss"]))
+            for p in model.hybridlink.parameters():
+                self.assertIsNotNone(p.grad)
+                self.assertTrue(torch.isfinite(p.grad).all())
+            optimizer.step()
+            self.assertTrue(any(not torch.equal(p, link_before[n]) for n, p in model.hybridlink.named_parameters()))
+            for n, p in model.backbone.named_parameters():
+                self.assertIsNone(p.grad)
+                self.assertTrue(torch.equal(p, before[n]), n)
+            with torch.no_grad():
+                logits_after = text_forward(model.backbone, input_ids=ids, return_dict=True).logits
+                link_after = model.run_hybridlink(hidden)
+            torch.testing.assert_close(logits_after, logits_before, rtol=0, atol=0)
+            model.save_pretrained(root / "link", Tokenizer())
+            restored = HybridAgentModel.from_pretrained(root / "link", dtype=torch.float32).eval()
+            self.assertEqual(restored.output_scale, model.output_scale)
+            torch.testing.assert_close(restored.run_hybridlink(hidden), link_after, rtol=0, atol=0)
+            with torch.no_grad():
+                logits_restored = text_forward(restored.backbone, input_ids=ids, return_dict=True).logits
+            torch.testing.assert_close(logits_restored, logits_before, rtol=0, atol=0)
+            self.assertFalse((root / "link/model.safetensors").exists())
+            # FP32 link tensors must not silently be rounded by BF16 backbone loading.
+            mixed = HybridAgentModel.from_pretrained(root / "link", dtype=torch.bfloat16)
+            for n, p in mixed.hybridlink.named_parameters():
+                self.assertEqual(p.dtype, torch.float32)
+                self.assertTrue(torch.equal(p, model.hybridlink.state_dict()[n]))
+            with self.assertRaisesRegex(ValueError, "nonempty latent"):
+                model(**{**batch, "latent_mask": torch.zeros_like(ids)}, stage=HYBRIDLINK_ACTIVATION)
+            with self.assertRaisesRegex(ValueError, "nonzero training"):
+                model.calibrate_link_scale([])
+            with self.assertRaisesRegex(ValueError, "fully frozen"):
+                model.backbone.get_input_embeddings().requires_grad_(True)
+                model(**batch, stage=HYBRIDLINK_ACTIVATION)
+
     def test_one_step_schedule_has_nonzero_first_update(self):
         import torch
         from hybrid_sft.train import cosine_schedule_with_warmup

@@ -35,9 +35,16 @@ class HybridSFTModel(HybridAgentModel):
     def set_trainable(self, stage: str) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+        if stage == HYBRIDLINK_ACTIVATION:
+            # Keep the learned format, including LoRA and both anchor rows, fixed.
+            self.backbone.requires_grad_(False)
+            self.backbone.zero_grad(set_to_none=True)
+            self.backbone.eval()
+            self.hybridlink.float().requires_grad_(True)
+            return
         if is_lora_model(self):
             if stage != FORMAT_ACTIVATION:
-                raise ValueError("LoRA currently supports format_activation only")
+                raise ValueError("LoRA supports format_activation or frozen hybridlink_activation only")
             self.hybridlink.requires_grad_(False)
             return  # PEFT already selected LoRA weights and anchor rows; never unfreeze the base.
         train_backbone = stage in (FORMAT_ACTIVATION, SELF_CONDITIONED)
@@ -48,6 +55,76 @@ class HybridSFTModel(HybridAgentModel):
             base_backbone(self.backbone).model.visual.requires_grad_(False)
         for p in self.hybridlink.parameters():
             p.requires_grad = train_link
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if not any(p.requires_grad for p in self.backbone.parameters()):
+            self.backbone.eval()
+        return self
+
+    def _link_pairs(self, input_ids, attention_mask, latent_mask):
+        """Teacher states and next-token embeddings at latent sources only."""
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            raise ValueError("HybridLink activation requires a fully frozen backbone")
+        self.backbone.eval()
+        sources = (latent_mask[:, :-1].bool() & attention_mask[:, :-1].bool()
+                   & attention_mask[:, 1:].bool())
+        if not sources.any():
+            raise ValueError("HybridLink activation requires nonempty latent spans")
+        with torch.no_grad():
+            embeddings = self.backbone.get_input_embeddings()(input_ids)
+            hidden = text_decoder(self.backbone)(
+                inputs_embeds=embeddings, attention_mask=attention_mask,
+                use_cache=False, return_dict=True,
+            ).last_hidden_state
+            targets = embeddings[:, 1:][sources].float()
+        exits = ~latent_mask[:, 1:][sources].bool()
+        return hidden[:, :-1][sources].detach(), targets, exits
+
+    @torch.no_grad()
+    def calibrate_link_scale(self, batches):
+        """Match unscaled prediction RMS to target RMS using training batches only.
+
+        This fits magnitude, not direction or reasoning; freezes the scalar for
+        subsequent optimization. Replaces output_scale without using its old value.
+        """
+        target_square = predicted_square = 0.0
+        elements = pairs = count = 0
+        for batch in batches:
+            hidden, targets, _ = self._link_pairs(
+                batch["input_ids"], batch["attention_mask"], batch["latent_mask"],
+            )
+            predictions = self.hybridlink(hidden.to(next(self.hybridlink.parameters()).dtype)).float()
+            if not torch.isfinite(predictions).all() or not torch.isfinite(targets).all():
+                raise ValueError("nonfinite calibration vectors")
+            target_square += targets.double().square().sum().item()
+            predicted_square += predictions.double().square().sum().item()
+            elements += targets.numel()
+            pairs += targets.shape[0]
+            count += 1
+        if elements == 0 or target_square <= 0 or predicted_square <= 0:
+            raise ValueError("calibration requires nonzero training vectors")
+        from hybrid_agent.compat import checked_scale
+        self.output_scale = checked_scale((target_square / predicted_square) ** 0.5)
+        return {"output_scale": self.output_scale, "batches": count, "pairs": pairs,
+                "target_rms": (target_square / elements) ** 0.5,
+                "unscaled_prediction_rms": (predicted_square / elements) ** 0.5}
+
+    def _link_activation(self, input_ids, attention_mask, latent_mask):
+        hidden, targets, exits = self._link_pairs(input_ids, attention_mask, latent_mask)
+        # Optimize in FP32; do not quantize the prediction to BF16 before the loss.
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            predictions = self.run_hybridlink(hidden, output_dtype=torch.float32)
+        cosine = 1.0 - F.cosine_similarity(predictions, targets, dim=-1)
+        mse = (predictions - targets).square().mean(dim=-1)
+        loss = LAMBDA_COS * cosine.mean() + LAMBDA_MSE * mse.mean()
+        loss = loss + EXIT_ANCHOR_HYBRIDLINK_WEIGHT * (
+            LAMBDA_COS * self._masked_mean(cosine, exits)
+            + LAMBDA_MSE * self._masked_mean(mse, exits)
+        )
+        return {"loss": loss, "backbone_loss": loss.detach().new_zeros(()),
+                "hybridlink_loss": loss.detach(), "cos_loss": cosine.mean().detach(),
+                "mse_loss": mse.mean().detach()}
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -97,6 +174,9 @@ class HybridSFTModel(HybridAgentModel):
             loss_mask = attention_mask
         if latent_mask is None:
             latent_mask = torch.zeros_like(attention_mask, dtype=torch.float32, device=input_ids.device)
+
+        if stage == HYBRIDLINK_ACTIVATION:
+            return self._link_activation(input_ids, attention_mask, latent_mask)
 
         embed_layer = self.backbone.get_input_embeddings()
         input_embeds = embed_layer(input_ids)

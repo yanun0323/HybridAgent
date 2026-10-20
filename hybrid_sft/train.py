@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from hybrid_agent.model import add_anchor_tokens
 from hybrid_agent.lora import enable_format_lora, is_lora_model
+from hybrid_agent.compat import check_execution
 from hybrid_sft.data import HybridSFTDataset, collate_batch, resolve_data_file
 from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, STAGES, HybridSFTModel
 
@@ -65,6 +66,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=None, help="cap optimizer updates (e.g. 1 for a smoke test)")
     p.add_argument("--num_workers", type=int, default=NUM_WORKERS)
     p.add_argument("--revision", default=None, help="pin the base Hugging Face revision")
+    p.add_argument("--calibrate_link_scale", action="store_true",
+                   help="match HybridLink magnitude on training data before frozen activation")
     args = p.parse_args()
     if args.epochs is None:
         args.epochs = STAGE_EPOCHS[args.stage]
@@ -72,6 +75,8 @@ def parse_args():
         args.hybridlink_lr = STAGE_HYBRIDLINK_LR.get(args.stage, args.lr)
     if args.lora and args.stage != FORMAT_ACTIVATION:
         p.error("--lora currently supports format_activation only")
+    if args.calibrate_link_scale and args.stage != HYBRIDLINK_ACTIVATION:
+        p.error("--calibrate_link_scale requires hybridlink_activation")
     if args.max_steps is not None and args.max_steps < 1:
         p.error("--max_steps must be positive")
     if args.num_workers < 0:
@@ -101,6 +106,14 @@ def main():
     accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum, mixed_precision="bf16")
     if args.lora and (accelerator.num_processes != 1 or str(accelerator.distributed_type).endswith("DEEPSPEED")):
         raise ValueError("LoRA format training requires one process without DeepSpeed")
+    link_only = args.stage == HYBRIDLINK_ACTIVATION
+    if link_only:
+        if accelerator.num_processes != 1 or str(accelerator.distributed_type).endswith("DEEPSPEED"):
+            raise ValueError("frozen HybridLink activation requires one process without DeepSpeed")
+        output = Path(args.output_dir).resolve()
+        source = Path(args.model).resolve()
+        if output == source or output in source.parents or source in output.parents or output.exists():
+            raise ValueError("use a new output directory separate from the source checkpoint")
     set_seed(args.seed)
     is_main = accelerator.is_main_process
 
@@ -119,6 +132,8 @@ def main():
         print(f"Dataset: {len(dataset)} trajectories from {data_file}", flush=True)
     if len(dataset) == 0:
         raise RuntimeError("no usable trajectories in the data file")
+    if link_only and any(not any(sample["latent_mask"][:-1]) for sample in dataset.samples):
+        raise ValueError("every HybridLink training trajectory must contain a latent span")
 
     if is_main:
         print(f"Loading model from {args.model} ...", flush=True)
@@ -127,12 +142,34 @@ def main():
         require_hybridlink=(args.stage != FORMAT_ACTIVATION),
     )
     model.resize_to_tokenizer(tokenizer)
+    if hasattr(model, "lora_anchor_ids"):
+        actual = [tokenizer.convert_tokens_to_ids(t) for t in ("<latent>", "</latent>")]
+        if actual != model.lora_anchor_ids:
+            raise ValueError("checkpoint tokenizer anchor IDs do not match the saved model")
+    if link_only:
+        check_execution(model.backbone, batch_size=args.batch_size)
     if args.lora:
         enable_format_lora(model, tokenizer, rank=args.lora_rank, alpha=args.lora_alpha)
-    elif is_lora_model(model):
-        raise ValueError("continuing a LoRA checkpoint is not supported by this trainer yet")
+    elif is_lora_model(model) and not link_only:
+        raise ValueError("a loaded LoRA checkpoint supports frozen hybridlink_activation only")
+    lora_checkpoint = is_lora_model(model)
     model.set_trainable(args.stage)
-    model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if not link_only:
+        model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if link_only:
+        model.to(accelerator.device)
+        if args.calibrate_link_scale:
+            def calibration_batches():
+                for sample in dataset.samples:
+                    batch = collate_batch(tokenizer, [sample])
+                    yield {k: v.to(accelerator.device) for k, v in batch.items()}
+            calibration = model.calibrate_link_scale(calibration_batches())
+            print("Training-only scale calibration: " + json.dumps(calibration), flush=True)
+        else:
+            calibration = {"output_scale": model.output_scale, "calibrated": False}
+        # Record the source of the scale, never consult evaluation data.
+        import hashlib
+        calibration["data_sha256"] = hashlib.sha256(Path(data_file).read_bytes()).hexdigest()
 
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -169,6 +206,9 @@ def main():
     scheduler = cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    if link_only and is_main:
+        with open(Path(args.output_dir) / "link_calibration.json", "w") as f:
+            json.dump(calibration, f, indent=2)
     wandb_run = None
     if is_main:
         with open(os.path.join(args.output_dir, "train_args.json"), "w", encoding="utf-8") as f:
@@ -185,7 +225,7 @@ def main():
 
     def save(ckpt_dir: str) -> None:
         accelerator.wait_for_everyone()
-        if args.lora:
+        if lora_checkpoint:
             if is_main:
                 accelerator.unwrap_model(model).save_pretrained(ckpt_dir, tokenizer)
         else:
@@ -209,12 +249,23 @@ def main():
                     input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"], latent_mask=batch["latent_mask"], stage=args.stage,
                 )
+                if not torch.isfinite(out["loss"]):
+                    raise RuntimeError("nonfinite training loss")
                 accelerator.backward(out["loss"])
                 for key in ("loss", "backbone_loss", "hybridlink_loss"):
                     accum[key] += out[key].item()
                 accum["n"] += 1
 
                 if accelerator.sync_gradients:
+                    if link_only and global_step == 0:
+                        raw_model = accelerator.unwrap_model(model)
+                        if any(p.requires_grad or p.grad is not None for p in raw_model.backbone.parameters()):
+                            raise RuntimeError("frozen backbone/LoRA/anchor parameters received gradients")
+                        gradients = [p.grad for p in raw_model.hybridlink.parameters()]
+                        if (any(g is None or not torch.isfinite(g).all() for g in gradients)
+                                or not any(g.abs().sum() > 0 for g in gradients)):
+                            raise RuntimeError("HybridLink did not receive finite nonzero gradients")
+                        print("HybridLink gradients verified; backbone, LoRA and anchors frozen", flush=True)
                     if args.lora and global_step == 0:
                         raw_model = accelerator.unwrap_model(model)
                         anchor_parameters = [p for name, p in raw_model.backbone.named_parameters()
@@ -240,8 +291,10 @@ def main():
                     pbar.update(1)
                     if wandb_run is not None:
                         wandb_run.log({f"train/{k}": v for k, v in stats.items()} | {"train/step": global_step})
-                    if is_main and global_step % LOG_EVERY == 0:
-                        print(f"step={global_step} loss={stats['loss']:.4f} lr={stats['lr']:.2e}", flush=True)
+                    if is_main and (global_step == 1 or global_step % LOG_EVERY == 0 or global_step == max_steps):
+                        print(f"step={global_step} loss={stats['loss']:.8g} lr={stats['lr']:.2e} "
+                              f"cos_loss={out['cos_loss'].item():.8g} mse_loss={out['mse_loss'].item():.8g}",
+                              flush=True)
                     if args.save_steps > 0 and global_step % args.save_steps == 0:
                         save(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
                     if global_step >= max_steps:

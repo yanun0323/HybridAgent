@@ -65,7 +65,8 @@ Use `batch_size=1` / `--num_samples 1`. Batched paused-row state handling and
 HybridRL are deliberately rejected until mixed-state continuation and replay
 agreement are validated. This does not make the original full-parameter SFT
 pipeline fit on a single GPU. Optional single-process LoRA format activation is
- documented in `hybrid_sft/README.md`; later LoRA training stages are not supported.
+documented in `hybrid_sft/README.md`, along with frozen HybridLink activation
+from a saved LoRA checkpoint. LoRA self-conditioning and RL remain unsupported.
 
 Training and inference share an explicit `enable_thinking=True` prompt builder.
 Unsupported template endings fail rather than silently skipping every sample.
