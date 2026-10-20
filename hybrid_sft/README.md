@@ -457,3 +457,37 @@ prior single-record probe. It is not a controlled comparison of accumulation alo
 and lower average CE can hide individual regressions. No decrease is guaranteed,
 and these first-position training-set measurements are not answer accuracy,
 recursive-generation success, or generalization evidence.
+
+### Saved-update step-size probe
+
+If the joint update raises even its own mean CE, `scripts/link_step_size.py` probes
+fixed fractions of the saved parameter displacement without computing gradients,
+creating an optimizer, or saving new model weights:
+
+```bash
+python -u scripts/link_step_size.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 --joint-run /content/qwen-link-joint-8 \
+  --output-dir /content/qwen-link-step-size
+```
+
+The probe loads 27B once and swaps only HybridLink tensors in memory. Fractions
+are fixed at `0, 1, 0.01, 0.1` in execution order: first replay both endpoints on
+the same sixteen records and objective positions. Per-record endpoint CE must
+match the saved joint-run summary within `rtol=1e-4, atol=1e-5`, otherwise the
+script stops before measuring fractions. This is a fixed numerical check, not a
+criterion to tune after seeing results. Original endpoint tensors are copied
+exactly; intermediate tensors use FP32 `before + fraction * (after - before)`.
+
+The input file, source weights, row IDs, tokenizer, LoRA/anchor tensors and scale
+are checked against the joint experiment. Grad-enabled mixed-precision forward
+matches that experiment; graphs are discarded per record without backward.
+`run.json` records source hashes and settings, `measurements.jsonl` streams all CE
+measurements, and `summary.json` reports per-group means and individual changes.
+Existing outputs are rejected. There is no automatic model selection or checkpoint
+export, and no development or test split is read.
+
+This examines the actual saved AdamW update direction, not a raw-gradient finite
+difference test. Smaller fractions lowering training CE would support overshooting
+on this local update, not prove generalization or recursive latent success. BF16
+input quantization can hide small parameter changes. Observation rows remain
+training-set observations, not held-out evaluation.
