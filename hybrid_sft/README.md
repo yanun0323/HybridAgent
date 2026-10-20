@@ -102,7 +102,8 @@ self-conditioning are separate work.
 
 ### Reproducible format pilot
 
-`scripts/format_experiment.py` provides `prepare`, `validate`, `train` and `evaluate` commands.
+`scripts/format_experiment.py` provides `prepare`, `prepare-generalization`,
+`validate`, `train` and `evaluate` commands.
 It uses synthetic `a*b-c` trajectories with one latent span, no tools, and a
 matching explicit system prompt at training and evaluation time. This is a
 single-template format-learning check, not evidence of improved reasoning.
@@ -161,3 +162,29 @@ If a run failed before creating `checkpoint/`, preserve `train.log` and
 `training-run.json` under new names before retrying. Do not regenerate the data
 or delete existing baseline evaluation. If checkpoints exist, inspect them first:
 this wrapper does not resume interrupted training.
+
+For a fixed-checkpoint generalization check, prepare a **separate** evaluation-only
+suite. This reads and verifies the existing pilot splits without changing them:
+
+```bash
+python scripts/format_experiment.py prepare-generalization \
+  --pilot /content/format-pilot --directory /content/format-generalization
+python scripts/format_experiment.py evaluate --directory /content/format-generalization \
+  --model Qwen/Qwen3.8-27B --revision <same-base-commit-as-training> \
+  --split generalization --output /content/format-generalization/base.jsonl
+python scripts/format_experiment.py evaluate --directory /content/format-generalization \
+  --model /content/format-pilot/checkpoint --split generalization \
+  --output /content/format-generalization/trained.jsonl
+```
+
+The suite fixes eight new operand tuples, excluding all pilot splits, within the
+same number ranges. Each tuple produces four questions: original-template control,
+reworded equivalent (direct wording or a bead-counting story), parentheses changing
+operation order, and a new structure (addition with multiplication or subtraction
+with a negative answer). These are **eight paired problems, not 32 independent
+problems**. The format system instruction, scoring and token budgets stay unchanged.
+Reports include both overall and per-group counts; raw outputs retain `group` and
+`pair_id` for paired inspection. Correct final answers do not verify intermediate
+calculations. This remains a small synthetic arithmetic probe, not a broad
+capability or latent-reasoning benchmark. Keep the checkpoint fixed and do not use
+these results for further tuning or checkpoint selection.

@@ -79,6 +79,65 @@ def prepare(directory, seed):
     })
 
 
+def prepare_generalization(directory, pilot):
+    """Fixed evaluation-only probe; exclude all operand tuples in the pilot."""
+    excluded, sources = set(), {}
+    for split in ("train", "validation", "test"):
+        path, manifest = verify_data(pilot, split)
+        sources[split] = sha256(path)
+        for line in path.read_text().splitlines():
+            if line.strip():
+                excluded.add(tuple(json.loads(line)["operands"]))
+    directory = Path(directory)
+    # A separate, new directory prevents accidental reuse as training data.
+    if directory.exists():
+        raise FileExistsError("choose a new directory; existing experiments are never overwritten")
+    pool = [(a, b, c) for a in range(50, 90) for b in range(2, 10)
+            for c in range(1, 20) if (a, b, c) not in excluded]
+    random.Random(6063).shuffle(pool)
+    if len(pool) < 8:
+        raise ValueError("not enough unused operand tuples")
+    rows = []
+    for i, (a, b, c) in enumerate(pool[:8]):
+        variants = [
+            ("control", f"Calculate {a} * {b} - {c}.", f"{a}*{b}-{c}", a*b-c),
+            ("reworded", (f"What remains if you subtract {c} from the product of {a} and {b}?"
+                           if i % 2 == 0 else
+                           f"There are {b} boxes with {a} beads each. After removing {c} beads "
+                           "in total, how many beads remain?"), f"{a}*{b}-{c}", a*b-c),
+            ("parentheses", f"Calculate ({a} - {c}) * {b}.", f"({a}-{c})*{b}", (a-c)*b),
+            ("new_structure", f"Calculate {a} + {b} * {c}." if i % 2 == 0 else
+                              f"Calculate {c} - {a} * {b}.",
+             f"{a}+{b}*{c}" if i % 2 == 0 else f"{c}-{a}*{b}",
+             a+b*c if i % 2 == 0 else c-a*b),
+        ]
+        for group, question, expression, answer in variants:
+            rows.append({"id": f"probe-{i}-{group}", "pair_id": f"probe-{i}",
+                         "group": group, "operands": [a, b, c], "expression": expression,
+                         "expected": answer, "system": SYSTEM, "question": question})
+    directory.mkdir(parents=True)
+    path = directory / "generalization.jsonl"
+    with path.open("x", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+    write_json(directory / "experiment.json", {
+        "seed": 6063, "evaluation_only": True, "pilot_sha256": sources,
+        "splits": {"generalization": {"count": len(rows), "sha256": sha256(path)}},
+        "evaluation": manifest["evaluation"],
+        "warning": "Eight paired problems in four groups, not 32 independent problems. "
+                   "Keep the existing checkpoint fixed; do not train on or tune against this probe. "
+                   "The format instruction is unchanged. Intermediate reasoning is not scored.",
+    })
+    print(f"Prepared {len(rows)} evaluation questions (8 per group) in {directory}", flush=True)
+
+
+def summarize_results(results):
+    return {mode: {"count": sum(r["mode"] == mode for r in results), **{
+        key: sum(r[key] for r in results if r["mode"] == mode)
+        for key in ("answer_correct", "format_valid", "truncated", "success")
+    }} for mode in ("plain", "format")}
+
+
 def verify_data(directory, split):
     directory = Path(directory)
     manifest = json.loads((directory / "experiment.json").read_text())
@@ -240,6 +299,7 @@ def evaluate(directory, model_spec, revision, split, output):
                 scored_text = (THINK_PREFILL if mode == "format" and prompt.endswith(THINK_PREFILL) else "") + raw
                 item = {
                     "id": row["id"], "question": row["question"], "expected": row["expected"],
+                    **{key: row[key] for key in ("group", "pair_id") if key in row},
                     "mode": mode, "raw": raw, "scored_text": scored_text, "end_reason": end_reason,
                     "output_tokens": len(generated),
                     **score_output(scored_text, row["expected"], mode, end_reason),
@@ -256,12 +316,12 @@ def evaluate(directory, model_spec, revision, split, output):
         "code_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "modes": {},
     }
-    for mode in ("plain", "format"):
-        selected = [r for r in results if r["mode"] == mode]
-        summary["modes"][mode] = {"count": len(selected), **{
-            key: sum(r[key] for r in selected)
-            for key in ("answer_correct", "format_valid", "truncated", "success")
-        }}
+    summary["modes"] = summarize_results(results)
+    if any("group" in r for r in results):
+        summary["groups"] = {
+            group: summarize_results([r for r in results if r.get("group") == group])
+            for group in sorted({r["group"] for r in results if "group" in r})
+        }
     write_json(output.with_suffix(".summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
@@ -272,6 +332,9 @@ def main():
     p = commands.add_parser("prepare")
     p.add_argument("--directory", required=True)
     p.add_argument("--seed", type=int, default=6060)
+    p = commands.add_parser("prepare-generalization")
+    p.add_argument("--directory", required=True)
+    p.add_argument("--pilot", required=True)
     p = commands.add_parser("validate")
     p.add_argument("--directory", required=True)
     p.add_argument("--model", default="Qwen/Qwen3.8-27B")
@@ -284,11 +347,13 @@ def main():
     p.add_argument("--directory", required=True)
     p.add_argument("--model", required=True)
     p.add_argument("--revision")
-    p.add_argument("--split", choices=("validation", "test"), default="validation")
+    p.add_argument("--split", choices=("validation", "test", "generalization"), default="validation")
     p.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.action == "prepare":
         prepare(args.directory, args.seed)
+    elif args.action == "prepare-generalization":
+        prepare_generalization(args.directory, args.pilot)
     elif args.action == "validate":
         validate(args.directory, args.model, args.revision)
     elif args.action == "train":
