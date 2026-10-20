@@ -123,6 +123,15 @@ class ThreeStepRuntimeTests(unittest.TestCase):
                 suffix[0, 6:] = 13
                 same = model(**{**batch, 'input_ids': suffix}, stage=LINK_NEXT_TOKEN, link_steps=3)
                 torch.testing.assert_close(same['loss'], out['loss'], rtol=0, atol=0)
+                self.assertEqual(same['predicted_ids'].shape, (1, 3))
+                # Tiny attention-only Qwen is a control where both execution
+                # paths should agree. This does NOT assume Qwen3.8 will agree.
+                from link_execution_probe import cached_rollout
+                cached = cached_rollout(model, {'input_ids': ids.tolist()[0], 'prompt_len': 1}, 32, 33)
+                torch.testing.assert_close(cached['step_losses'], out['step_losses'], rtol=1e-4, atol=1e-5)
+                self.assertEqual(cached['predicted_ids'].tolist(), out['predicted_ids'].tolist())
+                for a, b in zip(cached['rollout_vectors'], out['rollout_vectors']):
+                    torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
             for steps in (0, 2, 4):
                 with self.assertRaisesRegex(ValueError, 'link_steps'):
                     model(**batch, stage=LINK_NEXT_TOKEN, link_steps=steps)

@@ -209,7 +209,7 @@ class HybridSFTModel(HybridAgentModel):
             return decoder(inputs_embeds=embeddings, attention_mask=mask,
                            use_cache=False, return_dict=True).last_hidden_state[:, -1:]
 
-        vectors, losses = [], []
+        vectors, losses, predicted_ids = [], [], []
         for step in range(3):
             with torch.autocast(device_type=prefix.device.type, enabled=False):
                 prediction = self.run_hybridlink(hidden, output_dtype=torch.float32)
@@ -224,8 +224,10 @@ class HybridSFTModel(HybridAgentModel):
                 hidden = next_hidden(modified, mask)
             logits = self.backbone.get_output_embeddings()(hidden).float()
             losses.append(F.cross_entropy(logits[:, -1], input_ids[:, entry + step + 2]))
+            predicted_ids.append(logits[:, -1].argmax(-1).detach())
         step_losses = torch.stack(losses)
         return {"loss": step_losses.mean(), "step_losses": step_losses,
+                "predicted_ids": torch.stack(predicted_ids, dim=1),
                 "rollout_vectors": tuple(vectors),
                 "target_ids": input_ids[:, entry + 2:entry + 5].detach(),
                 "substitution_positions": list(range(entry + 1, entry + 4)),

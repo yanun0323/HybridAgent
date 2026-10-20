@@ -616,3 +616,35 @@ gradients with an independent uncheckpointed rollout, verify that the final loss
 reaches all three input vectors, and check that future/target tokens do not leak
 into the decoder. Actual A100 memory and runtime remain to be measured. This probe
 makes no claim of improved CE, generation, natural exits, or reasoning ability.
+
+### Compare full-prefix and cached execution
+
+Before interpreting three-input CE as evidence about cached inference, compare
+both paths on the **first eight training records**, original 64-step weights:
+
+```bash
+python -u scripts/link_execution_probe.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-execution-8
+```
+
+The backbone is loaded once. Each record runs `full_grad` through the actual
+three-input objective (graph discarded, no backward), then `full_no_grad` through
+the same objective, then `cached_no_grad`. The cached path prefills only the prompt,
+feeds assistant prefix tokens one by one through the entry, then feeds three
+recursive link predictions with explicit positions and a fresh cache. No known
+latent-content embedding is fed. All paths use BF16 autocast and FP32 HybridLink
+with outputs cast to embedding dtype. This holds precision and decoder/head access
+constant; the cached segmentation matches the development diagnostic, but this is
+not an exact replay of its older inference-mode/no-autocast environment.
+
+`grad_mode_comparison` isolates enabling gradients/checkpointing;
+`cache_segmentation_comparison` compares the two no-grad paths. Each path generates
+its own vectors, so later differences can include feedback from earlier differences,
+not just a single decoder-call difference. JSONL and summary retain each record's
+three CE values, probabilities, argmax IDs/text, target positions, and cross-path
+vector cosine/max-absolute differences. No threshold chooses a winning path or
+updates weights. The source files, parameter versions and absence of gradients are
+checked after measurement. No development or test data is opened. An observed
+mismatch does not by itself identify a kernel bug or establish reasoning ability.
