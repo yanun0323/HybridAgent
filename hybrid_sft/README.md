@@ -99,3 +99,51 @@ Do not use the hybrid engine to judge format-only checkpoints yet: HybridLink is
 still untrained. Evaluate format learning with ordinary text generation so the
 model writes the text inside `<latent>...</latent>`; later activation and
 self-conditioning are separate work.
+
+### Reproducible format pilot
+
+`scripts/format_experiment.py` provides `prepare`, `train` and `evaluate` commands.
+It uses synthetic `a*b-c` trajectories with one latent span, no tools, and a
+matching explicit system prompt at training and evaluation time. This is a
+single-template format-learning check, not evidence of improved reasoning.
+
+```bash
+python scripts/format_experiment.py prepare --directory /content/format-pilot
+python scripts/format_experiment.py evaluate --directory /content/format-pilot \
+  --model Qwen/Qwen3.8-27B --split validation \
+  --output /content/format-pilot/base-validation.jsonl
+python scripts/format_experiment.py train --directory /content/format-pilot
+python scripts/format_experiment.py evaluate --directory /content/format-pilot \
+  --model /content/format-pilot/checkpoint --split validation \
+  --output /content/format-pilot/trained-validation.jsonl
+```
+
+Preparation fixes 64 training, 16 validation and 32 reserved test questions and
+records their hashes. The operand range differs from the earlier notebook pilot;
+only exact operand tuples, not answer values or linguistic templates, are disjoint.
+Existing data/logs/evaluation files are not overwritten. Commands verify data
+hashes. Use `--revision` on base evaluation and training to pin the same Hub commit.
+
+Training runs two epochs, saving model checkpoints after 64 and 128 updates, and
+streams combined stdout/stderr to both the console and `train.log`. It records the
+command and code commit in `training-run.json`. On failure, keep the log; do not
+interpret a partial output directory as a completed experiment. The wrapper does
+not resume optimizer state. Run with no model already occupying the notebook GPU.
+
+Evaluation uses ordinary greedy **text** generation, never HybridLink or forced
+mode transitions. Every question is tested twice: plain integer-answer prompting
+and the trained format prompt. The opening `<think>` supplied by the chat template
+is included for structural scoring but is not credited as a generated token.
+Only an entire integer is accepted in plain mode. Format mode extracts only the
+single final `<answer>\\boxed{integer}</answer>` and separately checks exactly one
+nonempty latent span inside a think block, with plain text on both sides. Output
+budgets are fixed at 32/256 tokens. Truncated answers cannot count as success even
+when the parsed number happens to be correct. Raw outputs and separate answer,
+format, truncation and joint-success counts are saved as JSONL and summary JSON.
+
+Compare the base and trained validation results first. If selecting between saved
+checkpoints, use validation only, record the choice, then explicitly run
+`--split test` once for the selected checkpoint and its matching base. Test is never
+evaluated automatically. No automatic claim of improvement or model selection is
+made by the script. Large-model training/evaluation must be checked on the target
+GPU; dependency-free tests cover dataset isolation and scoring edge cases only.
