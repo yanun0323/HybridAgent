@@ -178,6 +178,59 @@ class HybridSFTModel(HybridAgentModel):
                 "target_id": target.detach(), "substitution_position": entry + 1,
                 "target_position": target_pos}
 
+    def _link_three_step(self, input_ids, attention_mask, latent_mask):
+        """Three recursive inputs, mean CE after each; no teacher content or cache.
+
+        Full-prefix recomputation matches the one-input smoke path, NOT the
+        sequential cached diagnostic. No detach between the three predictions.
+        This is exposed only to the standalone gradient probe, not train.py.
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError("three-step probe requires batch size one")
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            raise ValueError("three-step probe requires a fully frozen backbone")
+        self.backbone.eval()
+        positions = (latent_mask[0].bool() & attention_mask[0].bool()).nonzero().flatten()
+        if positions.numel() < 4:
+            raise ValueError("three-step probe requires entry and three content tokens")
+        entry = positions[0].item()
+        if (positions[:4].tolist() != list(range(entry, entry + 4))
+                or entry + 4 >= input_ids.shape[1]
+                or not attention_mask[0, :entry + 5].bool().all()):
+            raise ValueError("three-step probe requires an unpadded contiguous span and following target")
+        decoder = text_decoder(self.backbone)
+        with torch.no_grad():
+            prefix = self.backbone.get_input_embeddings()(input_ids[:, :entry + 1])
+            hidden = decoder(inputs_embeds=prefix, attention_mask=attention_mask[:, :entry + 1],
+                             use_cache=False, return_dict=True).last_hidden_state[:, -1:]
+
+        def next_hidden(embeddings, mask):
+            # Pass mask explicitly: backward recomputes earlier, shorter prefixes.
+            return decoder(inputs_embeds=embeddings, attention_mask=mask,
+                           use_cache=False, return_dict=True).last_hidden_state[:, -1:]
+
+        vectors, losses = [], []
+        for step in range(3):
+            with torch.autocast(device_type=prefix.device.type, enabled=False):
+                prediction = self.run_hybridlink(hidden, output_dtype=torch.float32)
+            vectors.append(prediction)
+            if prediction.requires_grad:
+                prediction.retain_grad()
+            modified = torch.cat((prefix, *(v.to(prefix.dtype) for v in vectors)), dim=1)
+            mask = attention_mask[:, :entry + step + 2]
+            if torch.is_grad_enabled() and modified.requires_grad:
+                hidden = checkpoint(next_hidden, modified, mask, use_reentrant=False)
+            else:
+                hidden = next_hidden(modified, mask)
+            logits = self.backbone.get_output_embeddings()(hidden).float()
+            losses.append(F.cross_entropy(logits[:, -1], input_ids[:, entry + step + 2]))
+        step_losses = torch.stack(losses)
+        return {"loss": step_losses.mean(), "step_losses": step_losses,
+                "rollout_vectors": tuple(vectors),
+                "target_ids": input_ids[:, entry + 2:entry + 5].detach(),
+                "substitution_positions": list(range(entry + 1, entry + 4)),
+                "target_positions": list(range(entry + 2, entry + 5))}
+
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask = mask.float()
@@ -221,7 +274,10 @@ class HybridSFTModel(HybridAgentModel):
         loss_mask: Optional[torch.Tensor] = None,
         latent_mask: Optional[torch.Tensor] = None,
         stage: str = SELF_CONDITIONED,
+        link_steps: int = 1,
     ) -> Dict[str, torch.Tensor]:
+        if link_steps not in (1, 3) or (link_steps != 1 and stage != LINK_NEXT_TOKEN):
+            raise ValueError("link_steps must be 1, or 3 with link_next_token for the gradient probe")
         if loss_mask is None:
             loss_mask = attention_mask
         if latent_mask is None:
@@ -230,6 +286,8 @@ class HybridSFTModel(HybridAgentModel):
         if stage == HYBRIDLINK_ACTIVATION:
             return self._link_activation(input_ids, attention_mask, latent_mask)
         if stage == LINK_NEXT_TOKEN:
+            if link_steps == 3:
+                return self._link_three_step(input_ids, attention_mask, latent_mask)
             return self._link_next_token(input_ids, attention_mask, latent_mask)
 
         embed_layer = self.backbone.get_input_embeddings()

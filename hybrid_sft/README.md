@@ -569,3 +569,50 @@ All measurements stream to `measurements.jsonl`. No model is selected or saved.
 These 48 records did not participate in the eight-record joint update, but they
 were used in earlier training: they are not a held-out test or evidence of
 recursive-generation success. The reserved test remains unopened.
+
+### Three-input backward-only probe
+
+Before attempting recursive training, `scripts/link_three_step_probe.py` checks
+one backward pass through three predicted inputs on the **first training record**:
+
+```bash
+python -u scripts/link_three_step_probe.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-three-step-probe
+```
+
+This deliberately starts from the original 64-step activation checkpoint, not the
+10% interpolated diagnostic weights. It tests gradient feasibility, not whether
+that diagnostic improvement is preserved. No optimizer is created, no weights are
+updated or exported, and no development/test records are read. The standalone
+probe uses `LINK_NEXT_TOKEN` with `link_steps=3`; the training CLI remains limited
+to its existing single-input smoke path.
+
+The known prefix ends at the entry anchor. Each prediction is fed back through
+the frozen decoder to produce the state for the next prediction, without detach.
+Loss is the mean of three next-token CEs after feeding one, two, and three vectors
+(target positions `entry+2`, `entry+3`, `entry+4`). The third target may be the exit
+if the reference contains exactly three content tokens. No reference content is
+fed to the decoder, and target IDs are used only for CE. FP32 link outputs are cast
+to the embedding dtype for input; their FP32 tensors retain gradients for reporting.
+The decoder recomputes the full prefix without a cache, checkpointing each pass
+with its own explicit attention mask. This matches the single-input training
+probe's execution style, **not** the sequential cached development diagnostic.
+A successful backward pass alone does not establish agreement between those paths.
+
+`run.json` saves the fixed sample ID, record/input hashes, data/checkpoint hashes,
+scale, seed and code version before model loading. `forward.json` saves per-step
+CE and target/substitution positions before backward. `summary.json` reports link
+and per-input gradient norms, peak allocated GPU memory and elapsed time. All
+three input gradients must be finite and nonzero. Backbone/LoRA/anchors must remain
+frozen, gradient-free and have unchanged tensor versions; link tensors are compared
+exactly to their pre-backward copies, and source link/LoRA file hashes are rechecked.
+The backbone check avoids duplicating 27B weights and is not a full bytewise
+comparison. Outputs must use a new directory; failures are never resumed.
+
+Tests on a tiny LoRA model compare the checkpointed three-step objective and link
+gradients with an independent uncheckpointed rollout, verify that the final loss
+reaches all three input vectors, and check that future/target tokens do not leak
+into the decoder. Actual A100 memory and runtime remain to be measured. This probe
+makes no claim of improved CE, generation, natural exits, or reasoning ability.
