@@ -14,6 +14,8 @@ from typing import Any
 
 import torch
 
+from .compat import check_execution, text_forward
+from .prompts import build_prompt
 from .constants import (
     ENTRY_ANCHOR,
     EXIT_ANCHOR,
@@ -104,6 +106,7 @@ class HybridGenerationEngine:
         self.system_prompt = system_prompt
         self.question = question
         self.B = int(batch_size)
+        check_execution(self.backbone, batch_size=self.B)
 
         # Budget per trajectory: text tokens + latent steps, or every slot after the
         # prompt (tool observations included) when count_tool_tokens is set.
@@ -202,20 +205,14 @@ class HybridGenerationEngine:
     # ------------------------------------------------------------------
 
     def _build_prompt(self) -> str:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": self.question},
-        ]
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+        prompt = build_prompt(self.tokenizer, self.system_prompt, self.question)
         self.initial_prompt = prompt
         return prompt
 
     @torch.no_grad()
     def _init_generation(self) -> bool:
         prompt = self._build_prompt()
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         prompt_ids = inputs["input_ids"][0].tolist()
         self.prompt_len = len(prompt_ids)
         self.prompt_ends_in_think = prompt.rstrip("\n").endswith(THINK_OPEN)
@@ -224,9 +221,9 @@ class HybridGenerationEngine:
 
         prefill_kwargs = dict(use_cache=True, output_hidden_states=True, return_dict=True)
         try:
-            outputs = self.backbone(**inputs, logits_to_keep=1, **prefill_kwargs)
+            outputs = text_forward(self.backbone, **inputs, logits_to_keep=1, **prefill_kwargs)
         except TypeError:
-            outputs = self.backbone(**inputs, **prefill_kwargs)
+            outputs = text_forward(self.backbone, **inputs, **prefill_kwargs)
         self.past_kv = outputs.past_key_values
         expand_cache_batch(self.past_kv, self.B)
         self.next_logits = outputs.logits[:, -1, :].repeat(self.B, 1)

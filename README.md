@@ -54,7 +54,7 @@ Checkpoints and data load from a local directory or directly from the Hugging Fa
 | HybridAgent-HybridSFT-v1 / -v2 | HybridSFT training sets: hybrid trajectories (`train.jsonl`), v1 and the upgraded v2 | [`togethercomputer/HybridAgent-HybridSFT-v1`](https://huggingface.co/datasets/togethercomputer/HybridAgent-HybridSFT-v1), [`togethercomputer/HybridAgent-HybridSFT-v2`](https://huggingface.co/datasets/togethercomputer/HybridAgent-HybridSFT-v2) |
 | HybridAgent-HybridRL | HybridRL training sets: deep reasoning (`math.parquet`) and agentic search (`search.parquet`) | [`togethercomputer/HybridAgent-HybridRL`](https://huggingface.co/datasets/togethercomputer/HybridAgent-HybridRL) |
 
-*Note:* Each model directory holds the backbone in Hugging Face format together with the HybridLink weights (`adapter.pt`, `adapter_config.json`).
+*Note:* Each model directory holds the backbone in Hugging Face format together with the HybridLink weights (`adapter.pt`, `hybridlink_config.json`).
 
 ## 🚀 Quick start
 

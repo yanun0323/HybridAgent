@@ -11,6 +11,7 @@ import math
 import torch
 import torch.utils.checkpoint
 
+from hybrid_agent.compat import check_execution
 from hybrid_rl.config import LOGIT_CHUNK_SIZE, TEMPERATURE
 from hybrid_rl.trajectory import HybridTrajectory, TextAction
 
@@ -85,6 +86,7 @@ def exact_rollout_replay(
     """Returns (replayed log-probs, rollout log-probs) of the trajectory's text actions."""
     device = torch.device(device)
     lm = model.backbone
+    check_execution(lm, rl=True)
     embedding = lm.get_input_embeddings()
     output_head = lm.get_output_embeddings()
     actions, replay_length = _check_trajectory(traj, int(embedding.weight.shape[0]))

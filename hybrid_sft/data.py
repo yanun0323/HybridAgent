@@ -22,11 +22,10 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from hybrid_agent.constants import ENTRY_ANCHOR, EXIT_ANCHOR
-from hybrid_agent.prompts import SYSTEM_PROMPT
+from hybrid_agent.prompts import SYSTEM_PROMPT, THINK_PREFILL, build_prompt
 
 EXIT_ANCHOR_CE_WEIGHT = 2.0
 
-THINK_PREFILL = "<think>\n"
 _LATENT_SPAN_RE = re.compile(re.escape(ENTRY_ANCHOR) + r"(.*?)" + re.escape(EXIT_ANCHOR), re.DOTALL)
 
 
@@ -38,30 +37,6 @@ def resolve_data_file(data: str, filename: str) -> Path:
     from huggingface_hub import hf_hub_download
 
     return Path(hf_hub_download(repo_id=data, filename=filename, repo_type="dataset"))
-
-
-def _build_chat_messages(system: str, question: str) -> list[dict]:
-    messages: list[dict] = []
-    if (system or "").strip():
-        messages.append({"role": "system", "content": system.strip()})
-    messages.append({"role": "user", "content": (question or "").strip()})
-    return messages
-
-
-def build_prompt(tokenizer: PreTrainedTokenizerBase, system: str, question: str) -> str | None:
-    """Generation prompt from the chat template; None if the template is unusable."""
-    try:
-        prompt = tokenizer.apply_chat_template(
-            _build_chat_messages(system, question), add_generation_prompt=True, tokenize=False,
-        )
-    except Exception:
-        return None
-    if not isinstance(prompt, str):
-        return None
-    # The template either prefills "<think>\n" or ends at the assistant header.
-    if prompt.endswith(THINK_PREFILL) or prompt.endswith("assistant\n"):
-        return prompt
-    return None
 
 
 def _first_round_ok(rounds: list[dict]) -> bool:

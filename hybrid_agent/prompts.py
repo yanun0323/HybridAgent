@@ -23,3 +23,22 @@ This is a key first step.<latent>This is the latent reasoning process.</latent>T
 </think><python>python code here</python><result>python interpreter result here</result><think>
 This is a key first step.<latent>This is the latent reasoning process.</latent>This is the key conclusion.
 </think><answer>\boxed{answer here}</answer>'''
+
+
+THINK_PREFILL = "<think>\n"
+
+
+def build_prompt(tokenizer, system: str, question: str) -> str:
+    """One explicit thinking prefix for training and generation; fail on mismatch."""
+    messages = []
+    if (system or "").strip():
+        messages.append({"role": "system", "content": system.strip()})
+    messages.append({"role": "user", "content": (question or "").strip()})
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+    )
+    if not isinstance(prompt, str):
+        raise ValueError("chat template must return a string")
+    if prompt.endswith(THINK_PREFILL) or prompt.endswith("assistant\n"):
+        return prompt
+    raise ValueError("unsupported chat prefix: expected an assistant header or open <think> block")

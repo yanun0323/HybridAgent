@@ -12,13 +12,14 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from .compat import LINK_CONFIG, backbone_load_path, checked_scale, read_link_config
 from .constants import ANCHOR_TOKENS
 from .hybridlink import HYBRIDLINK_CONFIG, HybridLink
 
 HYBRIDLINK_WEIGHTS = "adapter.pt"
-HYBRIDLINK_CONFIG_FILE = "adapter_config.json"
+HYBRIDLINK_CONFIG_FILE = LINK_CONFIG
 
 
 def resolve_model_dir(path_or_repo: str | os.PathLike, revision: str | None = None) -> Path:
@@ -44,6 +45,7 @@ class HybridAgentModel(nn.Module):
     def __init__(self, backbone: nn.Module, hybridlink: HybridLink | None = None) -> None:
         super().__init__()
         self.backbone = backbone
+        self.output_scale = 1.0
         hidden_size = backbone.get_input_embeddings().weight.shape[-1]
         self.hybridlink = hybridlink if hybridlink is not None else HybridLink(hidden_size)
         self.hybridlink.to(dtype=next(backbone.parameters()).dtype)
@@ -60,17 +62,24 @@ class HybridAgentModel(nn.Module):
     ) -> "HybridAgentModel":
         """Load the backbone and, when present, the HybridLink weights of a checkpoint."""
         local = resolve_model_dir(path_or_repo, revision)
-        backbone = AutoModelForCausalLM.from_pretrained(
-            str(local), dtype=dtype, trust_remote_code=trust_remote_code
-        )
+        with backbone_load_path(local) as load_path:
+            config = AutoConfig.from_pretrained(str(load_path), trust_remote_code=trust_remote_code)
+            loader = AutoModelForCausalLM
+            if config.model_type == "qwen3_5":
+                from transformers import Qwen3_5ForConditionalGeneration
+                loader = Qwen3_5ForConditionalGeneration
+            backbone = loader.from_pretrained(
+                str(load_path), config=config, dtype=dtype, trust_remote_code=trust_remote_code
+            )
         model = cls(backbone)
         weights = local / HYBRIDLINK_WEIGHTS
         if weights.is_file():
-            config_file = local / HYBRIDLINK_CONFIG_FILE
-            if config_file.is_file():
-                tag = json.loads(config_file.read_text(encoding="utf-8")).get("adapter_type")
+            link_config = read_link_config(local)
+            if link_config:
+                tag = link_config.get("adapter_type")
                 if tag != HYBRIDLINK_CONFIG["adapter_type"]:
-                    raise ValueError(f"unsupported HybridLink config {tag!r} in {config_file}")
+                    raise ValueError(f"unsupported HybridLink config {tag!r}")
+            model.output_scale = checked_scale(link_config.get("output_scale", 1.0))
             state = torch.load(str(weights), map_location="cpu", weights_only=True)
             model.hybridlink.load_state_dict(state, strict=True)
         elif require_hybridlink:
@@ -83,7 +92,7 @@ class HybridAgentModel(nn.Module):
         """R(h): next-step latent inputs from last-layer hidden states."""
         link_dtype = next(self.hybridlink.parameters()).dtype
         x = hidden_states if hidden_states.dtype == link_dtype else hidden_states.to(link_dtype)
-        out = self.hybridlink(x)
+        out = self.hybridlink(x) * checked_scale(self.output_scale)
         if output_dtype is not None and out.dtype != output_dtype:
             out = out.to(output_dtype)
         return out
@@ -105,7 +114,7 @@ class HybridAgentModel(nn.Module):
             tokenizer.save_pretrained(output_dir)
         torch.save(link_sd, os.path.join(output_dir, HYBRIDLINK_WEIGHTS))
         with open(os.path.join(output_dir, HYBRIDLINK_CONFIG_FILE), "w", encoding="utf-8") as f:
-            json.dump(HYBRIDLINK_CONFIG, f, indent=2)
+            json.dump({**HYBRIDLINK_CONFIG, "output_scale": checked_scale(self.output_scale)}, f, indent=2)
 
 
 def load_hybrid_agent(

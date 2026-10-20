@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import torch
 
+from .compat import text_forward
+
 
 def _cache_layers(past_kv) -> list:
     layers = getattr(past_kv, "layers", None)
@@ -46,7 +48,7 @@ def forward_step(
     cache_position: torch.Tensor,      # [1] global cache slot index
 ):
     """One lockstep decode forward; returns (cache, next logits [B, V], last hidden [B, D])."""
-    outputs = lm(
+    outputs = text_forward(lm,
         inputs_embeds=input_embeds,
         past_key_values=past_key_values,
         attention_mask=attention_mask,

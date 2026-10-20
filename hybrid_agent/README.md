@@ -50,4 +50,44 @@ Constructor parameters: `max_response_tokens` (text tokens + latent steps per ro
 
 ## Checkpoints
 
-`load_hybrid_agent` accepts a local directory or a Hugging Face repo id and returns the model and tokenizer with the anchor tokens registered. A checkpoint directory contains the backbone (`model.safetensors`, `config.json`), the tokenizer files, and the HybridLink weights `adapter.pt` with `adapter_config.json`.
+`load_hybrid_agent` accepts a local directory or a Hugging Face repo id and returns the model and tokenizer with the anchor tokens registered. A checkpoint directory contains the backbone (`model.safetensors`, `config.json`), the tokenizer files, and the HybridLink weights `adapter.pt` with `hybridlink_config.json`.
+
+
+### Qwen3.5-style checkpoints (including Qwen3.8-27B)
+
+Experimental, text-only compatibility: the loader uses
+`Qwen3_5ForConditionalGeneration`, while hybrid forwards and SFT use its language
+model and output head. Vision weights are retained but frozen during SFT. This
+requires a Transformers version providing that model class (the development
+notebook used 5.13.0). Image/video inputs are not supported by the hybrid engine.
+
+Use `batch_size=1` / `--num_samples 1`. Batched paused-row state handling and
+HybridRL are deliberately rejected until mixed-state continuation and replay
+agreement are validated. This does not make the original full-parameter SFT
+pipeline fit on a single GPU; no LoRA training has been added.
+
+Training and inference share an explicit `enable_thinking=True` prompt builder.
+Unsupported template endings fail rather than silently skipping every sample.
+Adding `<latent>` and `</latent>` does not teach mode switching: format activation,
+link activation and self-conditioned training are still required. The engine exits
+latent mode using the LM-head argmax for `</latent>` (or the step limit), not the
+nearest-embedding pseudo-text readout.
+
+New saves use `hybridlink_config.json`, including a finite positive `output_scale`
+(default `1.0`). Set `model.output_scale` only to a separately validated calibration;
+notebook `.pt` dictionaries are not directly loadable HybridAgent checkpoints.
+Legacy `adapter_config.json` HybridLink checkpoints remain readable through a
+temporary symlink view that excludes the conflicting config from PEFT detection.
+Original checkpoint files are never renamed. Genuine PEFT configs are not hidden;
+this change does not itself add LoRA checkpoint support.
+
+Run regression checks from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The compatibility checks need only Python. Small model/mask tests require the
+project dependencies and skip when PyTorch or Transformers is absent. No test
+downloads model weights. Real Qwen GPU generation, tool pause/resume and training
+remain separate integration checks; these unit tests do not certify them.

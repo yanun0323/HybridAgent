@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from hybrid_agent.model import HybridAgentModel
+from hybrid_agent.compat import text_decoder
 
 FORMAT_ACTIVATION = "format_activation"
 HYBRIDLINK_ACTIVATION = "hybridlink_activation"
@@ -37,6 +38,8 @@ class HybridSFTModel(HybridAgentModel):
         train_link = stage in (HYBRIDLINK_ACTIVATION, SELF_CONDITIONED)
         for p in self.backbone.parameters():
             p.requires_grad = train_backbone
+        if getattr(self.backbone.config, "model_type", None) == "qwen3_5":
+            self.backbone.model.visual.requires_grad_(False)
         for p in self.hybridlink.parameters():
             p.requires_grad = train_link
 
@@ -91,7 +94,7 @@ class HybridSFTModel(HybridAgentModel):
 
         embed_layer = self.backbone.get_input_embeddings()
         input_embeds = embed_layer(input_ids)
-        decoder = self.backbone.get_decoder()
+        decoder = text_decoder(self.backbone)
 
         if stage == SELF_CONDITIONED:
             # pass 1: teacher forced; HybridLink predicts the next latent inputs one step ahead

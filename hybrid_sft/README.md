@@ -48,4 +48,4 @@ Epochs default to 1 / 2 / 1 for the three stages (`--epochs`; 1 / 1 / 1 and 1 / 
 
 ## Output
 
-Every checkpoint directory (`checkpoint-N/` and the final output) is a complete HybridAgent checkpoint: the backbone in Hugging Face format, the tokenizer with the anchor tokens, and the HybridLink weights (`adapter.pt`, `adapter_config.json`). It loads with `hybrid_agent.load_hybrid_agent` and is the initialization for HybridRL.
+Every checkpoint directory (`checkpoint-N/` and the final output) is a complete HybridAgent checkpoint: the backbone in Hugging Face format, the tokenizer with the anchor tokens, and the HybridLink weights (`adapter.pt`, `hybridlink_config.json`). It loads with `hybrid_agent.load_hybrid_agent` and is the initialization for HybridRL.

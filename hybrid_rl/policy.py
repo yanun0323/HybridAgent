@@ -8,9 +8,11 @@ import json
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from hybrid_agent.model import HybridAgentModel, add_anchor_tokens, resolve_model_dir
+from hybrid_agent.compat import check_execution
+from types import SimpleNamespace
 
 _DROPOUT_NAMES = (
     "attention_dropout", "hidden_dropout", "hidden_dropout_prob", "resid_pdrop", "embd_pdrop", "dropout",
@@ -59,6 +61,7 @@ def disable_dropout(module: torch.nn.Module) -> int:
 
 def load_policy(spec: str, device) -> tuple[HybridAgentModel, "AutoTokenizer"]:
     local = resolve_model_dir(spec)
+    check_execution(SimpleNamespace(config=AutoConfig.from_pretrained(str(local))), rl=True)
     tokenizer = AutoTokenizer.from_pretrained(str(local))
     add_anchor_tokens(tokenizer)
     tokenizer.padding_side = "left"

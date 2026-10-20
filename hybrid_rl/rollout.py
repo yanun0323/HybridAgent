@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from hybrid_agent.compat import check_execution
 from hybrid_agent.engine import DONE, HybridGenerationEngine, RowState
 from hybrid_rl.config import MAX_SEQUENCE_TOKENS, MAX_TURNS, TEMPERATURE, TOP_K, TOP_P
 from hybrid_rl.trajectory import HybridTrajectory, TextAction
@@ -16,6 +17,8 @@ class HybridPolicyRollout(HybridGenerationEngine):
     """The generation engine plus trajectory recording, one HybridTrajectory per row."""
 
     def __init__(self, *args, max_sequence_tokens: int = MAX_SEQUENCE_TOKENS, **kwargs):
+        model = args[0] if args else kwargs["model"]
+        check_execution(model.backbone, rl=True)
         super().__init__(*args, **kwargs)
         self.max_sequence_tokens = int(max_sequence_tokens)
         if self.max_sequence_tokens < 2:
