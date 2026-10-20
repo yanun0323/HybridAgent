@@ -33,9 +33,43 @@ def replacement_count(condition, length):
         return min(1, length)
     if condition == "first-4":
         return min(4, length)
-    if condition == "all":
+    if condition in ("all", "pred-direction", "target-direction"):
         return length
     raise ValueError("unknown substitution condition")
+
+
+def mixed_vector(prediction, target, condition):
+    """Oracle direction/RMS control; returned tensor has the actual input dtype.
+
+    Use this condition's current-state prediction, not a saved other-run vector.
+    FP32 arithmetic followed by the same BF16 cast as ordinary vector inputs.
+    """
+    import torch
+    p, t = prediction.float(), target.float()
+    pr = p.square().mean(dim=-1, keepdim=True).sqrt()
+    tr = t.square().mean(dim=-1, keepdim=True).sqrt()
+    if not (torch.isfinite(p).all() and torch.isfinite(t).all()):
+        raise ValueError("nonfinite direction/size control vector")
+    if (pr <= 0).any() or (tr <= 0).any():
+        raise ValueError("direction/size control requires nonzero vectors")
+    if condition == "pred-direction":
+        result = p * (tr / pr)
+    elif condition == "target-direction":
+        result = t * (pr / tr)
+    else:
+        raise ValueError("unknown direction/size condition")
+    result = result.to(target.dtype)
+    if not torch.isfinite(result).all():
+        raise ValueError("nonfinite direction/size vector after input cast")
+    return result
+
+
+def condition_names(suite):
+    if suite == "substitution":
+        return ("teacher", "first-1", "first-4", "all")
+    if suite == "direction-size":
+        return ("teacher", "all", "pred-direction", "target-direction")
+    raise ValueError("unknown diagnostic suite")
 
 
 def run_condition(model, tokenizer, sample, entry, exit, condition):
@@ -98,9 +132,17 @@ def run_condition(model, tokenizer, sample, entry, exit, condition):
             "target_rms": t.square().mean().sqrt().item(),
             "fed": "stop-before-exit" if step == length else ("predicted" if step < replace else "teacher"),
         }
-        steps.append(step_result)
         if step < length:
-            feed(prediction if step < replace else target_embed)
+            vector = prediction if step < replace else target_embed
+            if condition in ("pred-direction", "target-direction"):
+                vector = mixed_vector(prediction, target_embed, condition)
+                step_result["fed"] = condition
+            actual = vector.float().flatten()
+            step_result["fed_rms"] = actual.square().mean().sqrt().item()
+            step_result["fed_target_cosine"] = F.cosine_similarity(actual, t, dim=0).item()
+            step_result["fed_target_rms_ratio"] = step_result["fed_rms"] / step_result["target_rms"]
+            feed(vector)
+        steps.append(step_result)
 
     # Force the real exit anchor at reference length in ALL conditions. This
     # continuation tests recovery, not whether the model learned when to exit.
@@ -133,6 +175,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--reference", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--suite", choices=("substitution", "direction-size"), default="substitution")
     args = parser.parse_args()
     path, manifest = verify_data(args.directory, "latent-dev")
     output = Path(args.output)
@@ -166,7 +209,7 @@ def main():
             sample = tokenize_trajectory(tokenizer, row["system"], row["question"], reference["rounds"], 1024)
             if sample is None:
                 raise ValueError("reference trajectory rejected")
-            for condition in ("teacher", "first-1", "first-4", "all"):
+            for condition in condition_names(args.suite):
                 result = run_condition(model, tokenizer, sample, entry, exit, condition)
                 item = {"id": row["id"], "question": row["question"], "expected": row["expected"], **result}
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -174,13 +217,18 @@ def main():
                 summaries.append({k: v for k, v in item.items() if k != "steps"} | {
                     "first_step": result["steps"][0], "exit_step": result["steps"][-1],
                     "early_exit_steps": [s["step"] for s in result["steps"][:-1] if s["exit_argmax"]],
+                    "reference_mismatch_steps": [s["step"] for s in result["steps"]
+                                                 if s["predicted_id"] != s["target_id"]],
                 })
                 print(f"{row['id']} {condition}: exit_rank={result['steps'][-1]['exit_rank']}", flush=True)
     summary = {"model": args.model, "base_revision": model.base_model_revision,
         "data_sha256": sha256(path), "output_scale": model.output_scale,
         "link_sha256": sha256(Path(args.model) / "adapter.pt"),
         "code_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        "torch": torch.__version__, "results": summaries,
+        "torch": torch.__version__, "suite": args.suite, "results": summaries,
+        "direction_size_controls": "pred-direction = prediction * target_RMS / prediction_RMS; "
+                                   "target-direction = target * prediction_RMS / target_RMS. "
+                                   "Both use the current condition's prediction, then cast to input dtype.",
         "warning": "Known prefix, reference length and real exit anchor are forced. "
                    "All conditions use the same sequential cache segmentation. "
                    "Continuation is ordinary text, including any emitted latent tags; NOT autonomous latent reasoning."}

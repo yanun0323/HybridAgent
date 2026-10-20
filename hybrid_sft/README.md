@@ -350,3 +350,31 @@ to this diagnostic, so none of its outcomes count as autonomous reasoning succes
 It compares sequential execution, not full-sequence training execution; further
 segmentation comparisons may be needed if the all-reference control fails. No
 training, checkpoint modification, retuning, or change to evaluation rules occurs.
+
+For a direction-versus-magnitude diagnostic, use a new output file and
+`--suite direction-size` on the same checkpoint and two development questions:
+
+```bash
+python -u scripts/latent_diagnostic.py --directory /content/latent-pilot \
+  --model /content/qwen-link-64 --reference /content/format-pilot/checkpoint \
+  --suite direction-size --output /content/latent-pilot/direction-size-64.jsonl
+```
+
+This runs four fresh-cache conditions: `teacher` (reference embeddings), `all`
+(unmodified predictions), `pred-direction` (prediction multiplied by reference RMS
+/ prediction RMS), and `target-direction` (reference embedding multiplied by
+prediction RMS / reference RMS). Scaling uses FP32 arithmetic and the result is
+cast to the actual input dtype before feeding. Each condition recomputes its own
+predictions from its current state; magnitudes are not replayed from another run.
+This therefore compares recursive input policies, not identical hidden states at
+all later steps. The teacher/all controls are rerun under the same code.
+
+All latent-content positions are substituted in the two mixed conditions, but the
+exit remains the same forced **real** anchor in every condition. Zero/nonfinite
+vectors are rejected. JSONL records actual fed RMS, target RMS ratio and cosine
+after casting, in addition to the unmodified prediction measurements. Summaries
+list reference-token mismatch positions. Reference direction or magnitude uses
+known correct tokens: these conditions are diagnostic oracles, not deployable
+inference methods. Improvement supports a role for that intervention in these two
+trajectories; it does not establish general reasoning gains or an exclusive cause.
+The default substitution suite and all autonomous evaluation rules are unchanged.

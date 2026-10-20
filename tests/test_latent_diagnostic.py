@@ -21,6 +21,13 @@ class DiagnosticPlanTests(unittest.TestCase):
         self.assertEqual([diagnostic.replacement_count(c, 10) for c in
                           ("teacher", "first-1", "first-4", "all")], [0, 1, 4, 10])
         self.assertEqual(diagnostic.replacement_count("first-4", 2), 2)
+        self.assertEqual(diagnostic.condition_names("substitution"), ("teacher", "first-1", "first-4", "all"))
+        self.assertEqual(diagnostic.condition_names("direction-size"),
+                         ("teacher", "all", "pred-direction", "target-direction"))
+        for name in ("pred-direction", "target-direction"):
+            self.assertEqual(diagnostic.replacement_count(name, 10), 10)
+        with self.assertRaises(ValueError):
+            diagnostic.condition_names("unknown")
         with self.assertRaises(ValueError):
             diagnostic.replacement_count("unknown", 10)
 
@@ -28,6 +35,36 @@ class DiagnosticPlanTests(unittest.TestCase):
 @unittest.skipUnless(all(importlib.util.find_spec(n) for n in ("torch", "transformers")),
                      "requires torch and transformers")
 class DiagnosticRuntimeTests(unittest.TestCase):
+    def test_direction_size_controls_preserve_selected_direction_and_magnitude(self):
+        import torch
+        import torch.nn.functional as F
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                # Equal-sized dimensions but different directions AND magnitudes.
+                p = torch.tensor([[[3., 4., 0., 0.]]], dtype=dtype)
+                t = torch.tensor([[[0., 0., 6., 8.]]], dtype=dtype)
+                before_p, before_t = p.clone(), t.clone()
+                pd = diagnostic.mixed_vector(p, t, "pred-direction")
+                td = diagnostic.mixed_vector(p, t, "target-direction")
+                self.assertEqual(pd.dtype, dtype)
+                self.assertEqual(td.dtype, dtype)
+                torch.testing.assert_close(pd, p * 2)
+                torch.testing.assert_close(td, t / 2)
+                for vector, direction, magnitude in ((pd, p, t), (td, t, p)):
+                    self.assertAlmostEqual(F.cosine_similarity(vector.float().flatten(),
+                                                              direction.float().flatten(), dim=0).item(), 1, places=6)
+                    torch.testing.assert_close(vector.float().square().mean().sqrt(),
+                                               magnitude.float().square().mean().sqrt())
+                self.assertTrue(torch.equal(p, before_p))
+                self.assertTrue(torch.equal(t, before_t))
+        for bad in (torch.zeros_like(p), torch.full_like(p, float("nan")), torch.full_like(p, float("inf"))):
+            with self.assertRaises(ValueError):
+                diagnostic.mixed_vector(bad, t, "pred-direction")
+            with self.assertRaises(ValueError):
+                diagnostic.mixed_vector(p, bad, "target-direction")
+        with self.assertRaises(ValueError):
+            diagnostic.mixed_vector(p, t, "unknown")
+
     def test_same_segmentation_correct_substitutions_and_real_exit(self):
         import torch
         from unittest.mock import patch
@@ -50,7 +87,8 @@ class DiagnosticRuntimeTests(unittest.TestCase):
             def decode(self, ids, **kwargs):
                 return ",".join(map(str, ids))
         sample = {"input_ids": [2, 3, 9, 6, 2, 4, 5, 7, 8, 10, 3, 11, 1], "prompt_len": 3}
-        for condition, count in (("teacher", 0), ("first-1", 1), ("first-4", 4), ("all", 5)):
+        for condition, count in (("teacher", 0), ("first-1", 1), ("first-4", 4), ("all", 5),
+                                 ("pred-direction", 5), ("target-direction", 5)):
             with self.subTest(condition=condition):
                 calls, cache = [], None
                 def forward(backbone, **kwargs):
@@ -77,8 +115,15 @@ class DiagnosticRuntimeTests(unittest.TestCase):
                     result = diagnostic.run_condition(Model(), Tokenizer(), sample, 2, 3, condition)
                 self.assertEqual(len(calls), 9)
                 for i, token in enumerate((4, 5, 7, 8, 10)):
-                    expected = torch.full((4,), -7.0) if i < count else embedding.weight[token]
-                    torch.testing.assert_close(calls[i + 2][0, 0], expected)
+                    target = embedding.weight[token]
+                    expected = torch.full((4,), -7.0) if i < count else target
+                    if condition == "pred-direction":
+                        expected = -torch.ones(4) * target.square().mean().sqrt()
+                    elif condition == "target-direction":
+                        expected = target * (7 / target.square().mean().sqrt())
+                    actual = calls[i + 2][0, 0]
+                    torch.testing.assert_close(actual, expected)
+                    self.assertAlmostEqual(result["steps"][i]["fed_rms"], actual.square().mean().sqrt().item())
                 torch.testing.assert_close(calls[7][0, 0], embedding.weight[3])
                 self.assertEqual(result["replaced_tokens"], count)
                 self.assertEqual(result["steps"][-1]["target_id"], 3)
