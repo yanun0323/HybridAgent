@@ -418,3 +418,42 @@ future tokens, changed link weights, unchanged backbone weights/text logits and
 save/load equality. Pass this in Colab before the real 27B smoke. Passing one step
 establishes only differentiability and resource feasibility, not improved latent
 reasoning. No long training or reserved-test evaluation is authorized by this path.
+
+### Eight-record joint-update probe
+
+`scripts/link_joint_step.py` starts from the original 64-step activation checkpoint,
+not the single-example next-token update. It selects the first eight verified
+training records for one update and the next eight for observation only. The latter
+are **not held-out examples**: they were available to earlier training. No development
+or reserved-test records are loaded. Selection is fixed by file order, not losses.
+
+```bash
+python -u scripts/link_joint_step.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-link-joint-8
+```
+
+The objective is the same first-input next-token CE as the smoke path. Each loss
+is divided by eight and backpropagated separately, freeing its graph before the
+next record. After all eight, gradients are clipped once and AdamW takes exactly
+one step at `5e-5` with the previous optimizer settings. There is no warmup or
+scheduler in this one-step probe. Backbone, LoRA and anchors remain frozen; scale
+is reused with training-data hash validation. Peak memory still needs target-GPU
+measurement; graphs are not held for eight records simultaneously.
+
+`run.json` records IDs, hashes, source, settings and code version before model
+loading. `before.json` preserves measurements before the update. `summary.json`
+reports each record's before/after CE, objective positions and target ID, mean CE,
+and counts of decreases/increases (tolerance `1e-6`) separately for the update and
+observation groups. Measurements use the same grad-enabled, mixed-precision forward
+path as training, without backward for observation or post-update measurements.
+Only HybridLink is updated; saved LoRA/anchor tensors are checked against the source.
+The compact result is saved to `checkpoint/` within the new output directory.
+Existing directories are rejected; this script does not resume failed runs.
+
+This changes both the selected records and their joint objective relative to the
+prior single-record probe. It is not a controlled comparison of accumulation alone,
+and lower average CE can hide individual regressions. No decrease is guaranteed,
+and these first-position training-set measurements are not answer accuracy,
+recursive-generation success, or generalization evidence.
