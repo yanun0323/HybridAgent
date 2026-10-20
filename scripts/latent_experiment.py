@@ -92,6 +92,20 @@ def scored_engine_text(engine, tokenizer):
     return (THINK_PREFILL if engine.prompt_ends_in_think else "") + text
 
 
+def check_reference_config(model_path, ref):
+    # Comparison must change only HybridLink, not the learned text adapter.
+    for name in ("hybrid_lora.json", "tokenizer.json", "tokenizer_config.json"):
+        actual = json.loads((model_path / name).read_text())
+        expected = json.loads((ref / name).read_text())
+        if name == "tokenizer_config.json":
+            # Transformers records whether the load path was a local directory.
+            # Ignore only that provenance field; never edit checkpoint files.
+            actual.pop("is_local", None)
+            expected.pop("is_local", None)
+        if actual != expected:
+            raise ValueError(f"checkpoint/reference mismatch: {name}")
+
+
 def evaluate_hybrid(directory, model_spec, reference, split, output):
     import torch
     from safetensors.torch import load_file
@@ -104,10 +118,7 @@ def evaluate_hybrid(directory, model_spec, reference, split, output):
     if output.exists() or output.with_suffix(".summary.json").exists():
         raise FileExistsError("evaluation output already exists")
     model_path, ref = Path(model_spec), Path(reference)
-    # Comparison must change only HybridLink, not the learned text adapter.
-    for name in ("hybrid_lora.json", "tokenizer.json", "tokenizer_config.json"):
-        if json.loads((model_path / name).read_text()) != json.loads((ref / name).read_text()):
-            raise ValueError(f"checkpoint/reference mismatch: {name}")
+    check_reference_config(model_path, ref)
     before = load_file(str(ref / "lora/adapter_model.safetensors"))
     after = load_file(str(model_path / "lora/adapter_model.safetensors"))
     if before.keys() != after.keys() or any(

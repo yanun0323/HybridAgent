@@ -15,6 +15,39 @@ import format_experiment as format_pilot
 
 
 class LatentExperimentTests(unittest.TestCase):
+    def test_reference_config_ignores_only_local_source_flag(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, saved = root / "source", root / "saved"
+            source.mkdir()
+            saved.mkdir()
+            configs = {
+                "hybrid_lora.json": {"base_revision": "fixed", "anchor_ids": [32, 33]},
+                "tokenizer.json": {"model": {"vocab": {"a": 0}}},
+                "tokenizer_config.json": {"is_local": False, "eos_token": "EOS",
+                                          "padding_side": "left", "chat_template": "original"},
+            }
+            for name, value in configs.items():
+                format_pilot.write_json(source / name, value)
+                format_pilot.write_json(saved / name, value)
+            changed = {**configs["tokenizer_config.json"], "is_local": True}
+            format_pilot.write_json(saved / "tokenizer_config.json", changed)
+            before = {str(p): p.read_bytes() for d in (source, saved) for p in d.iterdir()}
+            experiment.check_reference_config(saved, source)
+            self.assertEqual(before, {p: Path(p).read_bytes() for p in before})
+            for key in ("eos_token", "padding_side", "chat_template", "unknown_future_setting"):
+                with self.subTest(key=key):
+                    format_pilot.write_json(saved / "tokenizer_config.json", {**changed, key: "different"})
+                    with self.assertRaisesRegex(ValueError, "tokenizer_config.json"):
+                        experiment.check_reference_config(saved, source)
+            format_pilot.write_json(saved / "tokenizer_config.json", changed)
+            for name in ("hybrid_lora.json", "tokenizer.json"):
+                with self.subTest(name=name):
+                    format_pilot.write_json(saved / name, {**configs[name], "is_local": True})
+                    with self.assertRaises(ValueError):
+                        experiment.check_reference_config(saved, source)
+                    format_pilot.write_json(saved / name, configs[name])
+
     def test_fixed_new_splits_preserve_old_data_and_training_only_scale(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
