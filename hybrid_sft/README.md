@@ -691,3 +691,33 @@ on all sixteen records with exact metric equality required. This is a saved-link
 replay, not a fresh reload of the 27B backbone. Source hashes are rechecked, and
 backbone parameter versions and absence of gradients are checked around the step.
 Existing outputs are rejected. Failed runs are not resumed or overwritten.
+
+### Remaining 48 records after the three-input update
+
+Use the saved three-input joint checkpoint unchanged, comparing it with the
+original 64-step source on records 17–64 in the same training file:
+
+```bash
+python -u scripts/link_three_step_remaining.py --pilot /content/format-pilot \
+  --model /content/qwen-link-64 --joint-run /content/qwen-link-three-step-joint-8 \
+  --output-dir /content/qwen-link-three-step-remaining-48
+```
+
+This loads the backbone once and swaps only the two saved FP32 link states in
+memory. Both checkpoints first replay all sixteen original controls on both
+paths against the joint summary, requiring exact metric equality before any
+remaining record is measured. A mismatch stops the run; no tolerances are tuned.
+Data hashes, fixed IDs, control tokenization hashes, checkpoint hashes, scale,
+tokenizer configuration and LoRA/anchor equality are checked. The full path stays
+grad-enabled (graphs discarded without backward), while cached execution uses
+no-grad with the same BF16 autocast as the joint experiment.
+
+`run.json` records provenance and selection; `measurements.jsonl` streams controls
+and remaining measurements with state/path labels. `summary.json` contains all
+48 paired per-record results, mean and per-position CE changes and three-position
+correct counts separately for full/cached paths. Terminal output prints totals
+and all records with any position's CE increase above `1e-6` or a correct-to-wrong
+argmax change, rather than dumping every unchanged record. No backward, optimizer,
+model export, fraction search or checkpoint selection occurs. Existing outputs
+are rejected, and source files remain unchanged. These records were used in earlier
+training; this is not held-out generalization or complete latent reasoning.
