@@ -25,6 +25,7 @@ from transformers import AutoTokenizer
 from hybrid_agent.model import add_anchor_tokens
 from hybrid_agent.lora import enable_format_lora, is_lora_model
 from hybrid_agent.compat import check_execution
+from hybrid_sft.calibration import read_training_calibration
 from hybrid_sft.data import HybridSFTDataset, collate_batch, resolve_data_file
 from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, STAGES, HybridSFTModel
 
@@ -66,8 +67,10 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=None, help="cap optimizer updates (e.g. 1 for a smoke test)")
     p.add_argument("--num_workers", type=int, default=NUM_WORKERS)
     p.add_argument("--revision", default=None, help="pin the base Hugging Face revision")
-    p.add_argument("--calibrate_link_scale", action="store_true",
-                   help="match HybridLink magnitude on training data before frozen activation")
+    scale_options = p.add_mutually_exclusive_group()
+    scale_options.add_argument("--calibrate_link_scale", action="store_true",
+                               help="match HybridLink magnitude on training data before frozen activation")
+    scale_options.add_argument("--link_calibration", help="reuse a calibration JSON matching the training file")
     args = p.parse_args()
     if args.epochs is None:
         args.epochs = STAGE_EPOCHS[args.stage]
@@ -75,8 +78,8 @@ def parse_args():
         args.hybridlink_lr = STAGE_HYBRIDLINK_LR.get(args.stage, args.lr)
     if args.lora and args.stage != FORMAT_ACTIVATION:
         p.error("--lora currently supports format_activation only")
-    if args.calibrate_link_scale and args.stage != HYBRIDLINK_ACTIVATION:
-        p.error("--calibrate_link_scale requires hybridlink_activation")
+    if (args.calibrate_link_scale or args.link_calibration) and args.stage != HYBRIDLINK_ACTIVATION:
+        p.error("link scale calibration requires hybridlink_activation")
     if args.max_steps is not None and args.max_steps < 1:
         p.error("--max_steps must be positive")
     if args.num_workers < 0:
@@ -125,6 +128,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     data_file = resolve_data_file(args.data, args.data_file)
+    calibration = read_training_calibration(args.link_calibration, data_file) if args.link_calibration else None
     dataset = HybridSFTDataset(
         tokenizer, data_file, max_length=args.max_length, text_only=(args.stage == FORMAT_ACTIVATION),
     )
@@ -158,7 +162,10 @@ def main():
         model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if link_only:
         model.to(accelerator.device)
-        if args.calibrate_link_scale:
+        if args.link_calibration:
+            model.output_scale = calibration["output_scale"]
+            print("Reused training-only scale calibration: " + json.dumps(calibration), flush=True)
+        elif args.calibrate_link_scale:
             def calibration_batches():
                 for sample in dataset.samples:
                     batch = collate_batch(tokenizer, [sample])

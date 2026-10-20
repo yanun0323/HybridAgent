@@ -127,6 +127,26 @@ file hash. Without the flag the checkpoint's existing scale is preserved. Never
 supply validation/test data for calibration. Its full pass is additional work even
 when `--max_steps 1` limits optimizer updates.
 
+To run a fixed 64-update pilot from the original format checkpoint, reuse the
+smoke calibration rather than recalibrating or continuing its updated link:
+
+```bash
+python -u -m hybrid_sft.train --stage hybridlink_activation \
+  --model /content/format-pilot/checkpoint --data /content/format-pilot/train.jsonl \
+  --output_dir /content/qwen-link-64 \
+  --link_calibration /content/qwen-link-smoke/link_calibration.json \
+  --hybridlink_lr 2e-4 --epochs 1 --batch_size 1 --grad_accum 1 --max_steps 64 \
+  --max_length 1024 --num_workers 0 --save_steps 0 --seed 6064
+```
+
+`--link_calibration` and `--calibrate_link_scale` are mutually exclusive. Reuse
+verifies the training file hash and positive finite scale before loading weights;
+it records the source calibration hash in the new output. It does not modify the
+source checkpoint or calibration. This uses the existing warmup/cosine schedule
+and saves only the final checkpoint; `max_steps` counts optimizer-loop iterations
+(the initial warmup iteration uses zero learning rate). Evaluate on `latent-dev`
+with unchanged limits; do not open `latent-test` for tuning.
+
 Activation uses frozen teacher states with the real preceding tokens; it predicts
 only latent next-token embeddings and the exit-anchor embedding. Text CE is not
 computed on this path (`backbone_loss=0` means omitted, not perfect text accuracy).
