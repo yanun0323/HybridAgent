@@ -112,6 +112,31 @@ def score_output(raw, expected, mode, end_reason):
     }
 
 
+def validate(directory, model, revision):
+    """Check every training record with the real tokenizer before loading weights."""
+    from transformers import AutoTokenizer
+    from hybrid_agent.model import add_anchor_tokens
+    from hybrid_sft.data import tokenize_trajectory
+
+    path, manifest = verify_data(directory, "train")
+    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    add_anchor_tokens(tokenizer)
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rejected, lengths = [], []
+    for row in rows:
+        sample = tokenize_trajectory(tokenizer, row["system"], row["question"],
+                                     row["rounds"], max_length=1024, text_only=True)
+        if sample is None:
+            rejected.append(row["id"])
+        else:
+            lengths.append(sample["n_tokens"])
+    print(f"Training records accepted: {len(lengths)}/{len(rows)}", flush=True)
+    if rejected or len(rows) != manifest["splits"]["train"]["count"]:
+        raise ValueError(f"training data validation failed; rejected IDs: {rejected}")
+    print(f"Maximum sequence length: {max(lengths)} / 1024", flush=True)
+    print("Validation passed; no model weights loaded and no data modified.", flush=True)
+
+
 def train(directory, model, revision):
     directory = Path(directory).resolve()
     data, _ = verify_data(directory, "train")
@@ -247,6 +272,10 @@ def main():
     p = commands.add_parser("prepare")
     p.add_argument("--directory", required=True)
     p.add_argument("--seed", type=int, default=6060)
+    p = commands.add_parser("validate")
+    p.add_argument("--directory", required=True)
+    p.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    p.add_argument("--revision")
     p = commands.add_parser("train")
     p.add_argument("--directory", required=True)
     p.add_argument("--model", default="Qwen/Qwen3.8-27B")
@@ -260,6 +289,8 @@ def main():
     args = parser.parse_args()
     if args.action == "prepare":
         prepare(args.directory, args.seed)
+    elif args.action == "validate":
+        validate(args.directory, args.model, args.revision)
     elif args.action == "train":
         train(args.directory, args.model, args.revision)
     else:

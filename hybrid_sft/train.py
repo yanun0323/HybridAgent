@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from hybrid_agent.model import add_anchor_tokens, resolve_model_dir
+from hybrid_agent.model import add_anchor_tokens
 from hybrid_agent.lora import enable_format_lora, is_lora_model
 from hybrid_sft.data import HybridSFTDataset, collate_batch, resolve_data_file
 from hybrid_sft.model import FORMAT_ACTIVATION, HYBRIDLINK_ACTIVATION, SELF_CONDITIONED, STAGES, HybridSFTModel
@@ -104,15 +104,24 @@ def main():
     set_seed(args.seed)
     is_main = accelerator.is_main_process
 
-    model_dir = resolve_model_dir(args.model, args.revision)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    # Fetch tokenizer files only before data validation, not a full model snapshot.
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     add_anchor_tokens(tokenizer)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    data_file = resolve_data_file(args.data, args.data_file)
+    dataset = HybridSFTDataset(
+        tokenizer, data_file, max_length=args.max_length, text_only=(args.stage == FORMAT_ACTIVATION),
+    )
     if is_main:
-        print(f"Loading model from {model_dir} ...", flush=True)
+        print(f"Dataset: {len(dataset)} trajectories from {data_file}", flush=True)
+    if len(dataset) == 0:
+        raise RuntimeError("no usable trajectories in the data file")
+
+    if is_main:
+        print(f"Loading model from {args.model} ...", flush=True)
     model = HybridSFTModel.from_pretrained(
         args.model, revision=args.revision, dtype=torch.bfloat16,
         require_hybridlink=(args.stage != FORMAT_ACTIVATION),
@@ -124,15 +133,6 @@ def main():
         raise ValueError("continuing a LoRA checkpoint is not supported by this trainer yet")
     model.set_trainable(args.stage)
     model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-    data_file = resolve_data_file(args.data, args.data_file)
-    dataset = HybridSFTDataset(
-        tokenizer, data_file, max_length=args.max_length, text_only=(args.stage == FORMAT_ACTIVATION),
-    )
-    if is_main:
-        print(f"Dataset: {len(dataset)} trajectories from {data_file}", flush=True)
-    if len(dataset) == 0:
-        raise RuntimeError("no usable trajectories in the data file")
 
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,

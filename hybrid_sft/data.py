@@ -40,10 +40,10 @@ def resolve_data_file(data: str, filename: str) -> Path:
 
 
 def _first_round_ok(rounds: list[dict]) -> bool:
-    """Round 0 must open with the think prefill (a bare answer is only legal after a tool round)."""
+    """Round 0 must open with <think>; the following newline is optional."""
     if not rounds:
         return False
-    return (rounds[0].get("assistant") or "").startswith(THINK_PREFILL)
+    return (rounds[0].get("assistant") or "").startswith("<think>")
 
 
 def _tokenize_assistant_text(
@@ -102,7 +102,13 @@ def tokenize_trajectory(
 
     for i, rd in enumerate(rounds):
         a = rd.get("assistant") or ""
-        chunk = a[len(THINK_PREFILL):] if (i == 0 and prompt_has_prefill) else a
+        chunk = a
+        if i == 0 and prompt_has_prefill:
+            # The chat template already supplied <think>\n. Consume only the
+            # actual opening tag and optional newline, never the first text char.
+            chunk = a[len("<think>"):]
+            if chunk.startswith("\n"):
+                chunk = chunk[1:]
         out = _tokenize_assistant_text(tokenizer, chunk)
         if out is None:
             return None

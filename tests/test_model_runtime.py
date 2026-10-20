@@ -30,6 +30,30 @@ class RuntimeTests(unittest.TestCase):
             restored = HybridAgentModel.from_pretrained(temp, dtype=torch.float32, require_hybridlink=True)
             torch.testing.assert_close(restored.run_hybridlink(hidden), expected)
 
+    def test_generated_experiment_record_passes_real_dataset_loader(self):
+        import importlib.util
+        import json
+        from hybrid_sft.data import HybridSFTDataset
+        script = Path(__file__).resolve().parents[1] / "scripts/format_experiment.py"
+        spec = importlib.util.spec_from_file_location("runtime_experiment", script)
+        experiment = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(experiment)
+        class Tokenizer:
+            eos_token_id = 999
+            def apply_chat_template(self, *args, **kwargs):
+                return "assistant\n<think>\n"
+            def __call__(self, text, **kwargs):
+                special = {"<latent>": 1000, "</latent>": 1001}
+                return {"input_ids": [special[text]] if text in special else list(map(ord, text))}
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "train.jsonl"
+            path.write_text(json.dumps(experiment.record(50, 3, 1)) + "\n")
+            dataset = HybridSFTDataset(Tokenizer(), path, 1024, text_only=True)
+            self.assertEqual(len(dataset), 1)
+            sample = dataset[0]
+            start = sample["prompt_len"]
+            self.assertEqual(sample["input_ids"][start:start + 8], list(map(ord, "Multiply")))
+
     def test_entry_exit_answer_and_observation_masks(self):
         from hybrid_sft.data import tokenize_trajectory
         class Tokenizer:

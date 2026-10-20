@@ -102,13 +102,14 @@ self-conditioning are separate work.
 
 ### Reproducible format pilot
 
-`scripts/format_experiment.py` provides `prepare`, `train` and `evaluate` commands.
+`scripts/format_experiment.py` provides `prepare`, `validate`, `train` and `evaluate` commands.
 It uses synthetic `a*b-c` trajectories with one latent span, no tools, and a
 matching explicit system prompt at training and evaluation time. This is a
 single-template format-learning check, not evidence of improved reasoning.
 
 ```bash
 python scripts/format_experiment.py prepare --directory /content/format-pilot
+python scripts/format_experiment.py validate --directory /content/format-pilot
 python scripts/format_experiment.py evaluate --directory /content/format-pilot \
   --model Qwen/Qwen3.8-27B --split validation \
   --output /content/format-pilot/base-validation.jsonl
@@ -147,3 +148,16 @@ checkpoints, use validation only, record the choice, then explicitly run
 evaluated automatically. No automatic claim of improvement or model selection is
 made by the script. Large-model training/evaluation must be checked on the target
 GPU; dependency-free tests cover dataset isolation and scoring edge cases only.
+
+
+The first assistant round must start with `<think>`; a following newline is
+optional. If the chat template already supplies `<think>\n`, the loader removes
+only the actual opening tag and one optional newline from the assistant text.
+This accepts the generated pilot records without changing their content or hashes.
+`validate` checks all training records with the real tokenizer without loading
+model weights. The trainer also validates its dataset before loading weights.
+
+If a run failed before creating `checkpoint/`, preserve `train.log` and
+`training-run.json` under new names before retrying. Do not regenerate the data
+or delete existing baseline evaluation. If checkpoints exist, inspect them first:
+this wrapper does not resume interrupted training.
