@@ -14,6 +14,19 @@ AVAILABLE = all(importlib.util.find_spec(n) for n in ('torch', 'transformers', '
 
 
 class JointPlanTests(unittest.TestCase):
+    def test_peft_comparison_uses_same_embedding_policy_as_save(self):
+        import ast
+        # Dependency-free guard: auto adds full embeddings after vocabulary
+        # resizing, but compact checkpoints deliberately exclude those matrices.
+        path = ROOT / 'scripts/lora_self_conditioned_joint.py'
+        calls = [n for n in ast.walk(ast.parse(path.read_text()))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == 'get_peft_model_state_dict']
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            values = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+            self.assertIs(values.get('save_embedding_layers'), False)
+
     def test_cli_is_single_update_only(self):
         import subprocess
         import sys
@@ -143,9 +156,16 @@ class JointRuntimeTests(unittest.TestCase):
             with joint.frozen_evaluation(model), torch.no_grad():
                 expected = joint.scalar_losses(model(**batches[0], stage=SELF_CONDITIONED))
             model.save_pretrained(root / 'saved', fixtures.Tokenizer())
-            saved = {k: v.detach().clone() for k, v in get_peft_model_state_dict(model.backbone).items()}
+            from safetensors.torch import load_file
+            saved = load_file(str(root / 'saved/lora/adapter_model.safetensors'))
+            compact = get_peft_model_state_dict(model.backbone, save_embedding_layers=False)
+            self.assertEqual(saved.keys(), compact.keys())
+            self.assertEqual(sum('trainable_tokens_delta' in k for k in saved), 2)
+            self.assertTrue(all('lora_' in k or 'trainable_tokens_delta' in k for k in saved))
+            for k, v in compact.items():
+                torch.testing.assert_close(v.detach().cpu(), saved[k], rtol=0, atol=0)
             joint.reload_adapters(model, root / 'saved')
-            for k, v in get_peft_model_state_dict(model.backbone).items():
+            for k, v in get_peft_model_state_dict(model.backbone, save_embedding_layers=False).items():
                 torch.testing.assert_close(v, saved[k], rtol=0, atol=0)
             check_frozen()
             with joint.frozen_evaluation(model), torch.no_grad():

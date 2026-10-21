@@ -215,7 +215,9 @@ def reload_adapters(raw, checkpoint):
     from peft import get_peft_model_state_dict, set_peft_model_state_dict
     from safetensors.torch import load_file
     saved = load_file(str(checkpoint / 'lora/adapter_model.safetensors'))
-    live = get_peft_model_state_dict(raw.backbone)
+    # Match save_pretrained's compact policy; PEFT's default 'auto' may add
+    # full embedding/head matrices when the vocabulary has been resized.
+    live = get_peft_model_state_dict(raw.backbone, save_embedding_layers=False)
     link = torch.load(checkpoint / 'adapter.pt', map_location='cpu', weights_only=True)
     def equal(a, b):
         return (a.keys() == b.keys() and all(a[k].dtype == b[k].dtype and
@@ -232,7 +234,7 @@ def reload_adapters(raw, checkpoint):
     if loaded.unexpected_keys:
         raise RuntimeError(f'unexpected saved PEFT keys: {loaded.unexpected_keys}')
     raw.hybridlink.load_state_dict(link, strict=True)
-    if not equal(saved, get_peft_model_state_dict(raw.backbone)) or not equal(link, raw.hybridlink.state_dict()):
+    if not equal(saved, get_peft_model_state_dict(raw.backbone, save_embedding_layers=False)) or not equal(link, raw.hybridlink.state_dict()):
         raise RuntimeError('restored adapter tensors differ from saved weights')
 
 
