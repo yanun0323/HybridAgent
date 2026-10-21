@@ -33,9 +33,25 @@ CE_CHUNK_SIZE = 2048
 
 class HybridSFTModel(HybridAgentModel):
 
-    def set_trainable(self, stage: str) -> None:
+    def set_trainable(self, stage: str, *, lora_self_conditioned: bool = False) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+        if lora_self_conditioned:
+            if stage != SELF_CONDITIONED or not is_lora_model(self):
+                raise ValueError("lora_self_conditioned requires self_conditioned and an existing LoRA checkpoint")
+            # Standalone feasibility probe only. Keep anchor deltas and all original
+            # weights fixed; the normal trainer still rejects LoRA self-conditioning.
+            adapters = [p for n, p in self.backbone.named_parameters()
+                        if ".lora_A." in n or ".lora_B." in n]
+            if not adapters:
+                raise ValueError("no LoRA A/B parameters found")
+            self.backbone.requires_grad_(False)
+            self.zero_grad(set_to_none=True)
+            for p in adapters:
+                p.data = p.data.float()
+                p.requires_grad_(True)
+            self.hybridlink.float().requires_grad_(True)
+            return
         if stage in (HYBRIDLINK_ACTIVATION, LINK_NEXT_TOKEN):
             # Keep the learned format, including LoRA and both anchor rows, fixed.
             self.backbone.requires_grad_(False)

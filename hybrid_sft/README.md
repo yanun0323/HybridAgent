@@ -51,12 +51,55 @@ Epochs default to 1 / 2 / 1 for the three stages (`--epochs`; 1 / 1 / 1 and 1 / 
 Every checkpoint directory (`checkpoint-N/` and the final output) is a complete HybridAgent checkpoint: the backbone in Hugging Face format, the tokenizer with the anchor tokens, and the HybridLink weights (`adapter.pt`, `hybridlink_config.json`). It loads with `hybrid_agent.load_hybrid_agent` and is the initialization for HybridRL.
 
 
+## Experimental LoRA + HybridLink two-pass backward probe
+
+`scripts/lora_self_conditioned_probe.py` tests one full trajectory using the existing
+self-conditioned two-pass objective: text/anchor CE plus latent regression and
+extra exit regression. First-pass predictions replace the shifted latent inputs
+(including the exit input) in pass two; gradients flow through both passes. These
+predictions come from teacher-forced history, not a free-running recursive rollout.
+
+The script explicitly enables only the saved LoRA A/B tensors and FP32 HybridLink.
+Original text/vision weights and both anchor deltas remain frozen. This is a
+resource-saving adaptation, not official full-parameter training. The normal
+training CLI and default `set_trainable` behavior still reject LoRA
+self-conditioning. No optimizer, parameter update or model export is provided.
+
+After restoring and verifying the original Colab artifacts, and passing the full
+test suite without skips, the separately authorized GPU probe is:
+
+```bash
+python -u scripts/lora_self_conditioned_probe.py \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --output-dir /content/qwen-lora-self-conditioned-probe
+```
+
+It requires one CUDA process without DeepSpeed and verifies the original 64-step
+link and saved LoRA hashes before model loading. It selects only the first training
+record (`mul-sub-54-5-6`) in fixed file order, preserves the full text/latent masks,
+uses no padding, keeps the recorded output scale, and enables non-reentrant decoder
+checkpointing. No development or reserved test data is read. Do not run alongside
+another loaded 27B model. Existing/overlapping output paths are rejected; preserve
+failed output and logs, with no automatic retries.
+
+`run.json` records source-file hashes, data/tokenization hashes, versions, GPU and
+settings; `forward.json` is written before backward; `summary.json` records losses,
+LoRA/Link gradient norms and peak allocated/reserved GPU memory. Every trainable
+tensor must have finite gradients and each group a nonzero gradient. Individual
+zero gradients are allowed. All parameter versions and frozen-parameter absence
+of gradients are checked; LoRA/Link/anchor values are compared exactly on CPU, and
+source-file hashes are rechecked. Version checks are not a full bytewise comparison
+of the 27B backbone. A successful probe proves neither learning nor natural exits,
+and does not establish memory feasibility once optimizer state is allocated.
+
 ## Experimental single-GPU LoRA format activation
 
 This is a resource-saving adaptation, not a reproduction of full-parameter
 HybridSFT. During `format_activation`, HybridLink stays frozen. A saved LoRA
-checkpoint can also initialize frozen `hybridlink_activation` (see below);
-LoRA self-conditioning and RL remain unsupported.
+checkpoint can also initialize frozen `hybridlink_activation` (see below).
+The normal trainer still rejects LoRA self-conditioning; a standalone backward-only
+probe is available above. LoRA RL remains unsupported.
 PEFT LoRA targets text attention/DeltaNet/MLP projections, not vision layers.
 Only the `<latent>` and `</latent>` rows of the input embedding and untied output
 head are trainable; the complete vocabulary matrices are not optimizer parameters.
