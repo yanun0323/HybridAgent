@@ -93,13 +93,84 @@ source-file hashes are rechecked. Version checks are not a full bytewise compari
 of the 27B backbone. A successful probe proves neither learning nor natural exits,
 and does not establish memory feasibility once optimizer state is allocated.
 
+## One eight-record LoRA + HybridLink update
+
+`scripts/lora_self_conditioned_joint.py` is a separate bounded experiment after the
+backward probe succeeds. It does **not** enable the normal training CLI. Run only
+with separate GPU authorization after tests pass without skips:
+
+```bash
+python -u scripts/lora_self_conditioned_joint.py \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --probe-run /content/qwen-lora-self-conditioned-probe \
+  --output-dir /content/qwen-lora-self-conditioned-joint-8
+```
+
+The exact original training-file, Link and LoRA hashes are required. The completed
+probe's source hashes, calibration, first-record tokenization, library versions and
+success checks must match. The first eight training records update and the next
+eight only observe this step; all participated in earlier training. No development
+or reserved test data is read. Start from the original 64-step source, not a later
+Link-only update. Existing output paths are rejected; no resume, retries or overwrite.
+
+Use the same full-trajectory two-pass objective as the probe, including text/exit
+CE and latent/exit regression. Each record's total objective is divided by eight
+before backward (equal record weights, not a pooled token average). One fresh
+AdamW (`foreach=False`, betas 0.9/0.95, no weight decay) updates LoRA A/B and Link
+at fixed `5e-6`, after one joint gradient clip at 1.0. Anchors and original
+text/vision weights stay frozen. No scheduler, shuffle, extra updates or checkpoint
+selection is provided. Every pre-update record must exactly replay its measured
+two-pass losses; the first must also replay the completed backward probe.
+
+Before/after measurements cover all sixteen records:
+
+- Grad-enabled two-pass objective, in the same training mode as the update.
+- Six self-fed vector inputs with full-prefix and cached execution, preserving
+  every position's CE, target probability and highest-scoring token. Both paths
+  use no-grad here; these are not the old grad-enabled full-path measurements.
+- Greedy text-only plain (32 token budget) and formatted (256) generation using
+  the existing format-experiment prompts and scoring.
+- Hybrid engine generation (256 text/vector steps, 0–64 vectors per span, one
+  turn), tools disabled, no forced entry. Forced exits at the safety limit are
+  counted and disqualify strict success. Raw text is retained to inspect visible
+  recalculation after exits; behavioral success alone does not prove latent computation.
+
+BF16 autocast is shared across phases, with FP32 trainable parameters. As in the
+probe, the two-pass Link operations follow autocast; the six-input diagnostics
+explicitly run Link operations in FP32. Text/hybrid generation uses no-grad and
+BF16 autocast, not the older inference-mode/no-autocast evaluation. Compare before
+and after within this run; do not treat it as exact replay of prior diagnostics.
+Evaluation temporarily freezes parameters and restores their flags/modes without
+clearing gradients; it rejects pending gradients. Before/after never loads a second
+27B model. Frozen original parameters are checked using versions/no gradients;
+anchor deltas are compared exactly. This is not a full bytewise backbone comparison.
+
+Save one final compact checkpoint immediately after the update, including both
+changed LoRA and Link, so later measurement failures do not discard the update.
+Only a completed `summary.json` marks a successful run; a checkpoint alone does not.
+Saved tensors must match live values exactly. Then clear only trainable tensors, restore
+both adapters from disk in the same backbone, and exactly replay **all** sixteen
+records' measurements and generated outputs. PEFT reload also copies frozen anchor
+deltas; only their version counters are refreshed, after exact value checks.
+Tokenizer, base reference, scale and source files must remain unchanged.
+
+`run.json` records the plan/provenance; `before.jsonl`, `after.jsonl` and
+`reloaded.jsonl` stream records; `update.json` records gradients and update losses;
+`summary.json` preserves per-position regressions, generation transitions and raw
+before/after evidence for both groups. Terminal output includes six-position
+regressions even if average loss improves. Preserve failures and partial output.
+A single-record backward memory result does not guarantee that optimizer state,
+other trajectories and generation all fit. This experiment tests an initial update,
+not generalization or successful autonomous reasoning.
+
 ## Experimental single-GPU LoRA format activation
 
 This is a resource-saving adaptation, not a reproduction of full-parameter
 HybridSFT. During `format_activation`, HybridLink stays frozen. A saved LoRA
 checkpoint can also initialize frozen `hybridlink_activation` (see below).
-The normal trainer still rejects LoRA self-conditioning; a standalone backward-only
-probe is available above. LoRA RL remains unsupported.
+The normal trainer still rejects LoRA self-conditioning; standalone backward-only
+and single-update experiments are available above. LoRA RL remains unsupported.
 PEFT LoRA targets text attention/DeltaNet/MLP projections, not vision layers.
 Only the `<latent>` and `</latent>` rows of the input embedding and untied output
 head are trainable; the complete vocabulary matrices are not optimizer parameters.

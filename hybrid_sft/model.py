@@ -39,8 +39,8 @@ class HybridSFTModel(HybridAgentModel):
         if lora_self_conditioned:
             if stage != SELF_CONDITIONED or not is_lora_model(self):
                 raise ValueError("lora_self_conditioned requires self_conditioned and an existing LoRA checkpoint")
-            # Standalone feasibility probe only. Keep anchor deltas and all original
-            # weights fixed; the normal trainer still rejects LoRA self-conditioning.
+            # Standalone probe/joint experiment only. Keep anchor deltas and all
+            # original weights fixed; the normal trainer still rejects this mode.
             adapters = [p for n, p in self.backbone.named_parameters()
                         if ".lora_A." in n or ".lora_B." in n]
             if not adapters:
