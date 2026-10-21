@@ -93,15 +93,19 @@ def scored_engine_text(engine, tokenizer):
 
 
 def check_reference_config(model_path, ref):
-    # Comparison must change only HybridLink, not the learned text adapter.
+    # Check tokenizer/base identity. Callers separately verify adapter weights.
     for name in ("hybrid_lora.json", "tokenizer.json", "tokenizer_config.json"):
         actual = json.loads((model_path / name).read_text())
         expected = json.loads((ref / name).read_text())
         if name == "tokenizer_config.json":
-            # Transformers records whether the load path was a local directory.
-            # Ignore only that provenance field; never edit checkpoint files.
-            actual.pop("is_local", None)
-            expected.pop("is_local", None)
+            # Loading provenance, not tokenization behavior. Offline loading may
+            # persist local_files_only=True. Reject malformed values, and never
+            # edit source files or ignore any vocabulary/template settings.
+            for config in (actual, expected):
+                for key in ("is_local", "local_files_only"):
+                    if key in config and type(config[key]) is not bool:
+                        raise ValueError(f"checkpoint/reference mismatch: {name}: invalid {key}")
+                    config.pop(key, None)
         if actual != expected:
             raise ValueError(f"checkpoint/reference mismatch: {name}")
 
