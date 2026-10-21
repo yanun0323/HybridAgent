@@ -218,6 +218,44 @@ measurements. No development or reserved test records are opened. This is a
 single-update matched comparison, not held-out generalization or proof of latent
 reasoning, nor a guarantee of isolated LoRA causality.
 
+## Fixed-vector execution diagnostic after the swaps
+
+`scripts/fixed_vector_execution.py` uses **A only** (original LoRA + joint-updated
+Link), on the same ordered sixteen training records. It verifies the completed
+swap run, source hashes, library versions, calibration and tokenization before
+loading one backbone. All 32 recorded A full/cached path metrics must replay
+exactly before any fixed-vector comparison. No two-pass loss or generation is
+repeated; existing text/exit results are not new measurements.
+
+For each record, capture six FP32 vectors from each original recursive path.
+Save these diagnostic inputs (not weights), read them back exactly, then feed
+each vector sequence unchanged into both execution paths. Fixed runs never call
+Link or feed reference content; reference tokens only supply CE labels. Both
+paths use identical vectors after casting to the embedding dtype, eval/no-grad
+and BF16 autocast. Prefix segmentation, masks and positions match each original
+path. Self-replay on the donor's original path must match its recorded metrics
+exactly; every fixed run repeats with fresh state and requires identical hidden
+states, logits and metrics. Cross-path differences are measurements, not replay
+failures; never relax self/repeat comparisons to make a run pass.
+
+`controls.jsonl` records historical controls. `measurements.jsonl` streams both
+vector donors and both paths, including six-position CE, probabilities, token IDs,
+raw token text, hidden/logit maximum and RMS differences, cosines and first differing
+positions. Position 0 is the entry output, before any vector; positions 1–6 follow
+the fixed inputs. `vectors-<id>.pt` files contain only the small CPU input tensors.
+`run.json` binds inputs and code; `summary.json` is written only after final
+parameter/anchor/source checks. Existing output paths are rejected. Failed outputs
+must be preserved, without automatic retries.
+
+After full tests and separate GPU authorization, supply the same `--pilot`,
+`--model`, `--calibration`, `--joint-run`, `--joint-evaluation`, and `--control-run`
+arguments as the swap command below, plus
+`--swap-run /content/qwen-self-conditioned-swap-16` and a fresh `--output-dir`.
+This diagnostic performs no backward, optimizer update or model export. Differences
+with fixed inputs narrow the question to execution (including prefix segmentation
+and precision); they do not alone establish a cache bug, generalization, natural
+exit or complete latent reasoning.
+
 ## Four saved-weight swaps without training
 
 `scripts/self_conditioned_swap.py` evaluates a fixed 2-by-2 comparison:
