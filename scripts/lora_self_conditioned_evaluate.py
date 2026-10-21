@@ -49,6 +49,14 @@ def verify_plan(run, update_report, before, update, observe):
         raise ValueError('update losses differ from pre-update controls')
 
 
+def verify_calibration(saved_path, recorded, original, scale):
+    """Compare the saved record verbatim; do not reassign its source-file hash."""
+    saved = json.loads(Path(saved_path).read_text())
+    if saved != recorded or original != recorded or original['output_scale'] != scale:
+        raise ValueError('calibration differs')
+    return original
+
+
 def require_replay(actual, expected, label):
     if actual != expected:
         raise RuntimeError(f'exact replay mismatch: {label}; stop, preserve evidence')
@@ -90,7 +98,7 @@ def install_saved(raw, checkpoint):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('pilot', 'model', 'joint-run', 'output-dir'):
+    for name in ('pilot', 'model', 'joint-run', 'calibration', 'output-dir'):
         parser.add_argument('--' + name, required=True)
     args = parser.parse_args()
     pilot, source, failed, output = [Path(v).resolve() for v in
@@ -141,9 +149,9 @@ def main():
     versions = {k: version(k) for k in ('torch', 'transformers', 'peft', 'accelerate', 'tokenizers')}
     if any(v != run[k] for k, v in versions.items()):
         raise ValueError('library versions differ from interrupted run')
-    calibration = read_training_calibration(checkpoint / 'link_calibration.json', data)
-    if calibration != run['calibration'] or calibration['output_scale'] != config['output_scale']:
-        raise ValueError('calibration differs')
+    calibration = verify_calibration(
+        checkpoint / 'link_calibration.json', run['calibration'],
+        read_training_calibration(args.calibration, data), config['output_scale'])
     accelerator = Accelerator(mixed_precision='bf16', gradient_accumulation_steps=1)
     if (accelerator.device.type != 'cuda' or accelerator.num_processes != 1
             or str(accelerator.distributed_type).endswith('DEEPSPEED')):
@@ -231,8 +239,10 @@ def main():
     reload_adapters(raw, checkpoint)  # clear trainable tensors, reload from disk, exact tensor check
     check_original()
     measure_all('reloaded', after)
-    if file_hashes(source) != source_hashes or file_hashes(failed) != failed_hashes or sha256(data) != TRAIN_SHA256:
-        raise RuntimeError('protected source, interrupted run or data changed')
+    if (file_hashes(source) != source_hashes or file_hashes(failed) != failed_hashes
+            or sha256(data) != TRAIN_SHA256
+            or sha256(args.calibration) != calibration['source_calibration_sha256']):
+        raise RuntimeError('protected source, interrupted run, data or calibration changed')
     torch.cuda.synchronize()
     summary = {
         'optimizer_steps_this_run': 0, 'original_optimizer_steps': 1, 'weights_saved': False,

@@ -17,6 +17,40 @@ AVAILABLE = all(importlib.util.find_spec(n) for n in ('torch', 'transformers', '
 
 
 class EvaluationPlanTests(unittest.TestCase):
+    def test_calibration_copy_keeps_original_file_provenance(self):
+        import hashlib
+        import json
+        spec = importlib.util.spec_from_file_location('calibration_copy_test', ROOT / 'hybrid_sft/calibration.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data, original, saved = root / 'train.jsonl', root / 'original.json', root / 'saved.json'
+            data.write_text('training record\n')
+            original.write_text(json.dumps({'output_scale': .012, 'pairs': 1628,
+                                'data_sha256': hashlib.sha256(data.read_bytes()).hexdigest()}))
+            recorded = module.read_training_calibration(original, data)
+            saved.write_text(json.dumps(recorded, indent=2) + '\n')
+            files = {p: p.read_bytes() for p in (data, original, saved)}
+            # Reproduce the old bug: rereading the copy replaces its source hash.
+            reread = module.read_training_calibration(saved, data)
+            self.assertNotEqual(reread['source_calibration_sha256'], recorded['source_calibration_sha256'])
+            result = evaluation.verify_calibration(saved, recorded,
+                        module.read_training_calibration(original, data), .012)
+            self.assertEqual(result, recorded)
+            with self.assertRaisesRegex(ValueError, 'calibration differs'):
+                evaluation.verify_calibration(saved, recorded, reread, .012)
+            for key, value in (('output_scale', .02), ('pairs', 1), ('data_sha256', 'wrong'),
+                               ('source_calibration_sha256', 'wrong'), ('reused', False)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    evaluation.verify_calibration(saved, recorded, {**recorded, key: value}, .012)
+            with self.assertRaises(ValueError):
+                evaluation.verify_calibration(saved, recorded, recorded, .02)
+            self.assertEqual(files, {p: p.read_bytes() for p in files})
+            saved.write_text(json.dumps({**recorded, 'pairs': 1}))
+            with self.assertRaises(ValueError):
+                evaluation.verify_calibration(saved, recorded, recorded, .012)
+
     def test_no_backward_optimizer_export_or_resume_and_controls_first(self):
         script = ROOT / 'scripts/lora_self_conditioned_evaluate.py'
         tree = ast.parse(script.read_text())
@@ -32,6 +66,7 @@ class EvaluationPlanTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(script), '--help'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--joint-run', result.stdout)
+        self.assertIn('--calibration', result.stdout)
         for option in ('--resume', '--lr', '--max-steps'):
             self.assertNotIn(option, result.stdout)
 

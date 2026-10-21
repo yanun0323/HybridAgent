@@ -178,6 +178,7 @@ For the recorded run interrupted before `after.jsonl`, use a **new** output dire
 ```bash
 python -u scripts/lora_self_conditioned_evaluate.py \
   --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
   --joint-run /content/qwen-lora-self-conditioned-joint-8 \
   --output-dir /content/qwen-lora-self-conditioned-joint-8-evaluation
 ```
@@ -185,7 +186,10 @@ python -u scripts/lora_self_conditioned_evaluate.py \
 This is not a resume command. It contains no backward, optimizer, weight update or
 model export. It is restricted to the recorded original and saved adapter hashes,
 original training file, sixteen fixed IDs, one-update plan, versions, calibration
-and tokenization. It also verifies source/saved tokenizer encodings agree on all
+and tokenization. `--calibration` must point to the original training calibration,
+not the checkpoint copy: its validated record, the recorded run and the checkpoint
+copy must match exactly, including the original calibration-file hash. It also
+verifies source/saved tokenizer encodings agree on all
 sixteen trajectories. The existing failed run, checkpoint and data remain read-only;
 all source/run file hashes are checked again at the end. No development/test data
 is opened. Preserve the failed log too; do not overwrite or rerun training.
