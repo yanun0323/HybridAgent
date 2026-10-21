@@ -33,10 +33,14 @@ CE_CHUNK_SIZE = 2048
 
 class HybridSFTModel(HybridAgentModel):
 
-    def set_trainable(self, stage: str, *, lora_self_conditioned: bool = False) -> None:
+    def set_trainable(self, stage: str, *, lora_self_conditioned: bool = False,
+                      link_only_self_conditioned: bool = False) -> None:
+        if lora_self_conditioned and link_only_self_conditioned:
+            raise ValueError("choose one self-conditioned parameter boundary")
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
-        if lora_self_conditioned:
+        self._link_only_self_conditioned = False
+        if lora_self_conditioned or link_only_self_conditioned:
             if stage != SELF_CONDITIONED or not is_lora_model(self):
                 raise ValueError("lora_self_conditioned requires self_conditioned and an existing LoRA checkpoint")
             # Standalone probe/joint experiment only. Keep anchor deltas and all
@@ -49,7 +53,8 @@ class HybridSFTModel(HybridAgentModel):
             self.zero_grad(set_to_none=True)
             for p in adapters:
                 p.data = p.data.float()
-                p.requires_grad_(True)
+                p.requires_grad_(not link_only_self_conditioned)
+            self._link_only_self_conditioned = link_only_self_conditioned
             self.hybridlink.float().requires_grad_(True)
             return
         if stage in (HYBRIDLINK_ACTIVATION, LINK_NEXT_TOKEN):
@@ -75,7 +80,8 @@ class HybridSFTModel(HybridAgentModel):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if not any(p.requires_grad for p in self.backbone.parameters()):
+        if (not getattr(self, '_link_only_self_conditioned', False)
+                and not any(p.requires_grad for p in self.backbone.parameters())):
             self.backbone.eval()
         return self
 

@@ -164,6 +164,60 @@ A single-record backward memory result does not guarantee that optimizer state,
 other trajectories and generation all fit. This experiment tests an initial update,
 not generalization or successful autonomous reasoning.
 
+## Matched two-pass Link-only control
+
+After separately authorizing a GPU run, the existing joint script can run one
+matched control from the **original** source, never the updated joint checkpoint:
+
+```bash
+python -u scripts/lora_self_conditioned_joint.py \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --probe-run /content/qwen-lora-self-conditioned-probe \
+  --link-only \
+  --joint-run /content/qwen-lora-self-conditioned-joint-8 \
+  --joint-evaluation /content/qwen-lora-self-conditioned-joint-8-evaluation-r2 \
+  --output-dir /content/qwen-link-self-conditioned-control-8
+```
+
+All three control options are required together. This uses the same first eight
+update records, next eight observation records, two-pass objective, BF16 autocast,
+FP32 LoRA/Link, seed, AdamW settings, averaging and single `5e-6` update. Only Link's
+52,459,520 parameters train. Existing LoRA, original backbone and anchor deltas
+remain frozen. The explicit model opt-in preserves the joint experiment's training
+mode and non-reentrant decoder checkpointing, rather than silently switching the
+frozen decoder to eval mode. Gradients still flow through the second decoder pass
+into first-pass Link predictions; freezing weights is not a `no_grad` decoder.
+The first-pass hidden states need no parameter gradients in this control. This
+local two-pass objective is not an exact reproduction of upstream's detached
+first pass. The normal SFT trainer does not expose this standalone control mode.
+
+Before any update, require the recorded source/saved joint weight hashes, completed
+recovery checks, original plan, all library versions, calibration provenance and
+sixteen tokenization hashes. Recompute joint summary reports from the raw recovery
+rows. All sixteen original controls must replay **exactly** on the control path,
+including generated text, before backward starts. A mismatch stops the run without
+relaxing tolerances. The eight backward losses must also replay before the one step.
+
+Use the same norm limit of 1, now over Link only. Record the pre-clip norm, clip
+multiplier and scope; this does **not** guarantee the same Link displacement as
+joint clipping over LoRA + Link. Verify frozen LoRA/anchors by exact values and all
+frozen parameters by versions/no gradients. Save a compact checkpoint immediately
+after the update. For replay, check the saved PEFT tensors against live frozen
+values, clear/reload **only Link**, and require exact sixteen-record replay without
+copying into frozen backbone tensors or refreshing their version counters.
+
+Outputs retain the existing before/after/reloaded JSONL and per-position regression
+reports. `summary.json` additionally contains `joint_vs_link_only`: `before` means
+joint **after-update** measurements and `after` means Link-only **after-update**
+measurements, explicitly labelled. Both groups preserve full per-row predictions
+and raw generation, even when mean losses improve. Probe, joint/recovery files,
+source, training data and original calibration remain unchanged. Preserve failed
+runs, use fresh output paths, and never repeat an already-saved update to recover
+measurements. No development or reserved test records are opened. This is a
+single-update matched comparison, not held-out generalization or proof of latent
+reasoning, nor a guarantee of isolated LoRA causality.
+
 ## Evaluate the saved interrupted LoRA + Link update without retraining
 
 The single-update run can stop after saving weights if tokenizer loading metadata

@@ -1,6 +1,7 @@
 """One eight-record LoRA + Link update; next eight records observe only.
 
-Official two-pass objective, frozen original weights and anchor deltas. No resume,
+Two-pass objective with first-pass gradients, frozen original weights and anchors.
+Optional matched Link-only control; not an exact upstream reproduction. No resume,
 shuffle, scheduler, repeated updates, development/test access or checkpoint search.
 """
 from __future__ import annotations
@@ -75,7 +76,7 @@ def frozen_evaluation(model):
             module.training = mode
 
 
-def train_once(model, batches, accelerator, optimizer, check_frozen, expected):
+def train_once(model, batches, accelerator, optimizer, check_frozen, expected, *, link_only=False):
     import torch
     from hybrid_sft.model import SELF_CONDITIONED
     if len(batches) != 8 or len(expected) != 8:
@@ -83,6 +84,8 @@ def train_once(model, batches, accelerator, optimizer, check_frozen, expected):
     raw = accelerator.unwrap_model(model)
     raw.train()
     params = [(n, p) for n, p in raw.named_parameters() if p.requires_grad]
+    if link_only and (not params or any(not n.startswith('hybridlink.') for n, _ in params)):
+        raise RuntimeError('Link-only control has trainable backbone parameters')
     optimizer.zero_grad(set_to_none=True)
     metrics = []
     for i, batch in enumerate(batches):
@@ -94,7 +97,7 @@ def train_once(model, batches, accelerator, optimizer, check_frozen, expected):
         metrics.append(metric)
         del out
         print(f'Backward {i + 1}/8: loss={metric["loss"]:.8g}', flush=True)
-    lora = gradient_report((n, p) for n, p in params if n.startswith('backbone.'))
+    lora = {} if link_only else gradient_report((n, p) for n, p in params if n.startswith('backbone.'))
     link = gradient_report(raw.hybridlink.named_parameters())
     check_frozen()
     norm = accelerator.clip_grad_norm_([p for _, p in params], 1.)
@@ -106,7 +109,9 @@ def train_once(model, batches, accelerator, optimizer, check_frozen, expected):
         raise RuntimeError('nonfinite updated parameters')
     check_frozen()
     return {'pre_update_losses': metrics, 'lora_gradient_norms': lora, 'link_gradient_norms': link,
-            'total_norm_before_clip': norm.item(), 'optimizer_steps': 1}
+            'total_norm_before_clip': norm.item(),
+            'clip_multiplier': min(1., 1. / (norm.item() + 1e-6)),
+            'clip_scope': 'Link only' if link_only else 'LoRA + Link', 'optimizer_steps': 1}
 
 
 def text_generation(model, tokenizer, row, mode):
@@ -209,11 +214,13 @@ def compare_records(rows, before, after):
     return result
 
 
-def reload_adapters(raw, checkpoint):
+def reload_adapters(raw, checkpoint, *, link_only=False):
     """Read saved PEFT + Link tensors into the SAME backbone, verify exact values."""
     import torch
     from peft import get_peft_model_state_dict, set_peft_model_state_dict
     from safetensors.torch import load_file
+    if link_only and any(p.requires_grad for p in raw.backbone.parameters()):
+        raise RuntimeError('Link-only reload requires frozen backbone')
     saved = load_file(str(checkpoint / 'lora/adapter_model.safetensors'))
     # Match save_pretrained's compact policy; PEFT's default 'auto' may add
     # full embedding/head matrices when the vocabulary has been resized.
@@ -225,24 +232,74 @@ def reload_adapters(raw, checkpoint):
     if not equal(saved, live) or not equal(link, raw.hybridlink.state_dict()):
         raise RuntimeError('saved adapter tensors differ from live weights')
     # Clear only trainable tensors, forcing restoration from disk rather than a
-    # no-op reload. Original weights and frozen anchor deltas are never cleared.
+    # no-op reload. The Link-only control verifies saved PEFT values but never
+    # copies them back: even frozen backbone version counters must stay unchanged.
     with torch.no_grad():
         for p in raw.parameters():
             if p.requires_grad:
                 p.zero_()
-    loaded = set_peft_model_state_dict(raw.backbone, saved, adapter_name='default')
-    if loaded.unexpected_keys:
-        raise RuntimeError(f'unexpected saved PEFT keys: {loaded.unexpected_keys}')
+    if not link_only:
+        loaded = set_peft_model_state_dict(raw.backbone, saved, adapter_name='default')
+        if loaded.unexpected_keys:
+            raise RuntimeError(f'unexpected saved PEFT keys: {loaded.unexpected_keys}')
     raw.hybridlink.load_state_dict(link, strict=True)
     if not equal(saved, get_peft_model_state_dict(raw.backbone, save_embedding_layers=False)) or not equal(link, raw.hybridlink.state_dict()):
         raise RuntimeError('restored adapter tensors differ from saved weights')
+
+
+def verify_joint_reference(joint, evaluation, source_hashes, update, observe):
+    """Bind the control to the preserved update and completed recovery evaluation."""
+    from lora_self_conditioned_evaluate import (
+        verify_plan, require_replay, SAVED_LINK_SHA256, SAVED_LORA_SHA256,
+    )
+    def read(directory, name):
+        return json.loads((directory / name).read_text())
+    def rows(directory, name):
+        return [json.loads(s) for s in (directory / name).read_text().splitlines() if s.strip()]
+    run, report = read(joint, 'run.json'), read(joint, 'update.json')
+    before = rows(joint, 'before.jsonl')
+    verify_plan(run, report, before, update, observe)
+    saved_hashes = file_hashes(joint)
+    if (run['source_hashes'] != source_hashes or
+            saved_hashes.get('checkpoint/adapter.pt') != SAVED_LINK_SHA256 or
+            saved_hashes.get('checkpoint/lora/adapter_model.safetensors') != SAVED_LORA_SHA256):
+        raise ValueError('joint source or saved weights differ')
+    erun, summary = read(evaluation, 'run.json'), read(evaluation, 'summary.json')
+    expected = {'optimizer_steps_this_run': 0, 'original_optimizer_steps': 1,
+                'weights_saved': False, 'saved_link_sha256': SAVED_LINK_SHA256,
+                'saved_lora_sha256': SAVED_LORA_SHA256,
+                **dict.fromkeys(('original_16_controls_exact', 'saved_adapter_replay_exact',
+                     'anchors_values_unchanged', 'original_backbone_versions_no_grad_unchanged',
+                     'protected_files_unchanged'), True)}
+    if any(summary.get(k) != v for k, v in expected.items()):
+        raise ValueError('joint recovery did not pass all checks')
+    if (erun['code_commit'] != '2f37602dcf09b299a0cc9fab43193a7dab71afd0' or
+            erun['original_plan'] != run or erun['interrupted_run_hashes'] != saved_hashes or
+            erun['source_hashes'] != source_hashes or erun['data_sha256'] != TRAIN_SHA256 or
+            erun['tokenization_sha256'] != run['tokenization_sha256'] or
+            any(erun[k] != run[k] for k in ('torch', 'transformers', 'peft', 'accelerate', 'tokenizers'))):
+        raise ValueError('joint recovery provenance differs')
+    require_replay(rows(evaluation, 'control.jsonl'), before, 'joint controls')
+    after = rows(evaluation, 'after.jsonl')
+    require_replay(rows(evaluation, 'reloaded.jsonl'), after, 'joint saved replay')
+    # Recompute reports from raw rows, including IDs and generated text.
+    require_replay(summary['update'], compare_records(update, before[:8], after[:8]), 'joint update report')
+    require_replay(summary['observation'], compare_records(observe, before[8:], after[8:]), 'joint observation report')
+    if read(joint / 'checkpoint', 'link_calibration.json') != run['calibration']:
+        raise ValueError('saved joint calibration differs')
+    return {'run': run, 'report': report, 'before': before, 'after': after}
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('pilot', 'model', 'calibration', 'probe-run', 'output-dir'):
         p.add_argument('--' + name, required=True)
+    p.add_argument('--link-only', action='store_true', help='matched two-pass control; freeze LoRA')
+    p.add_argument('--joint-run')
+    p.add_argument('--joint-evaluation')
     args = p.parse_args()
+    if args.link_only != bool(args.joint_run) or args.link_only != bool(args.joint_evaluation):
+        p.error('--link-only requires both --joint-run and --joint-evaluation, and vice versa')
     source, pilot, probe, output = [Path(v).resolve() for v in
                                    (args.model, args.pilot, args.probe_run, args.output_dir)]
     validate_paths(source, pilot, output)
@@ -258,6 +315,15 @@ def main():
     probe_run = json.loads((probe / 'run.json').read_text())
     probe_summary = json.loads((probe / 'summary.json').read_text())
     verify_probe(probe_run, probe_summary, hashes)
+    reference = None
+    protected = {probe: file_hashes(probe)}
+    if args.link_only:
+        for directory in (args.joint_run, args.joint_evaluation):
+            path = Path(directory).resolve()
+            validate_paths(source, path, output)
+            protected[path] = file_hashes(path)
+        reference = verify_joint_reference(Path(args.joint_run), Path(args.joint_evaluation),
+                                           hashes, update, observe)
 
     import torch
     import transformers
@@ -282,6 +348,13 @@ def main():
     versions = {'torch': torch.__version__, 'transformers': transformers.__version__, 'peft': peft.__version__}
     if any(versions[k] != probe_run[k] for k in versions):
         raise ValueError('library versions differ from probe')
+    if reference is not None:
+        from importlib.metadata import version
+        if any(version(k) != reference['run'][k] for k in
+               ('torch', 'transformers', 'peft', 'accelerate', 'tokenizers')):
+            raise ValueError('library versions differ from joint reference')
+        if calibration != reference['run']['calibration']:
+            raise ValueError('calibration differs from joint reference')
     set_seed(6064)
     tokenizer = AutoTokenizer.from_pretrained(source)
     if tokenizer.pad_token_id is None:
@@ -300,13 +373,18 @@ def main():
     token_hashes = [hashlib.sha256(json.dumps(s, sort_keys=True).encode()).hexdigest() for s in samples]
     if token_hashes[0] != probe_run['tokenization_sha256']:
         raise ValueError('probe tokenization differs')
+    if reference is not None and token_hashes != reference['run']['tokenization_sha256']:
+        raise ValueError('tokenization differs from joint reference')
     output.mkdir(parents=True)
     write_json(output / 'run.json', {
         'source': str(source), 'source_hashes': hashes, 'data_sha256': TRAIN_SHA256,
         'probe_run_sha256': sha256(probe / 'run.json'), 'probe_summary_sha256': sha256(probe / 'summary.json'),
         'update_ids': [r['id'] for r in update], 'observation_ids': [r['id'] for r in observe],
         'tokenization_sha256': token_hashes, 'calibration': calibration, 'seed': 6064,
-        'planned_optimizer_steps': 1, 'gradient_average_count': 8, 'learning_rate_lora': LR,
+        'planned_optimizer_steps': 1, 'gradient_average_count': 8,
+        'learning_rate_lora': None if args.link_only else LR, 'link_only': args.link_only,
+        'protected_run_hashes': {str(k): v for k, v in protected.items()},
+        'joint_run': args.joint_run, 'joint_evaluation': args.joint_evaluation,
         'learning_rate_link': LR, 'betas': [.9, .95], 'weight_decay': 0., 'max_grad_norm': 1.,
         'shuffle': False, 'scheduler': None, 'anchors_frozen': True, 'hybrid_limits': HYBRID_LIMITS,
         'text_budgets': {'plain': 32, 'format': 256}, 'recursive_steps': 6,
@@ -322,10 +400,13 @@ def main():
         raise ValueError('expected matching LoRA checkpoint')
     check_execution(model.backbone, batch_size=1)
     model.resize_to_tokenizer(tokenizer)
-    model.set_trainable(SELF_CONDITIONED, lora_self_conditioned=True)
+    model.set_trainable(SELF_CONDITIONED, lora_self_conditioned=not args.link_only,
+                        link_only_self_conditioned=args.link_only)
     model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
     trainable = {n: p for n, p in model.named_parameters() if p.requires_grad}
-    if (not trainable or sum(p.numel() for p in trainable.values()) != probe_summary['trainable_parameters']
+    expected_parameters = 52459520 if args.link_only else probe_summary['trainable_parameters']
+    if (not trainable or sum(p.numel() for p in trainable.values()) != expected_parameters
+            or (args.link_only and any(not n.startswith('hybridlink.') for n in trainable))
             or any(p.dtype != torch.float32 or not (n.startswith('hybridlink.') or '.lora_A.' in n or '.lora_B.' in n)
                    for n, p in trainable.items())):
         raise RuntimeError('unexpected trainable parameter or dtype')
@@ -336,6 +417,8 @@ def main():
     frozen = {n: p._version for n, p in raw.named_parameters() if not p.requires_grad}
     initial = {n: p.detach().cpu().clone() for n, p in raw.named_parameters() if p.requires_grad}
     anchors = {n: p.detach().cpu().clone() for n, p in raw.named_parameters() if 'trainable_tokens_delta' in n}
+    frozen_adapters = {n: p.detach().cpu().clone() for n, p in raw.named_parameters()
+                       if args.link_only and ('.lora_A.' in n or '.lora_B.' in n)}
     if len(anchors) != 2:
         raise RuntimeError('expected two frozen anchor tensors')
     def check_frozen(check_versions=True):
@@ -345,14 +428,19 @@ def main():
                 raise RuntimeError(f'frozen parameter changed: {n}')
             if n in anchors and not torch.equal(param.detach().cpu(), anchors[n]):
                 raise RuntimeError(f'anchor values changed: {n}')
-    def measure_all(phase):
+            if n in frozen_adapters and not torch.equal(param.detach().cpu(), frozen_adapters[n]):
+                raise RuntimeError(f'frozen LoRA values changed: {n}')
+    def measure_all(phase, controls=None):
         results = []
         with (output / f'{phase}.jsonl').open('x') as stream:
-            for row, sample, batch in zip(rows, samples, batches):
+            for i, (row, sample, batch) in enumerate(zip(rows, samples, batches)):
                 item = measure_record(model, raw, accelerator, tokenizer, row, sample, batch, entry, exit)
                 stream.write(json.dumps(item, ensure_ascii=False) + '\n')
                 stream.flush()
                 results.append(item)
+                if controls is not None and item != controls[i]:
+                    raise RuntimeError(f'exact replay mismatch: {phase}/{row["id"]}; preserve evidence')
+                check_frozen()
                 if phase == 'before' and len(results) == 1:
                     if item['two_pass'] != {k: probe_summary[k] for k in LOSS_KEYS}:
                         raise RuntimeError('first-record loss differs from completed probe; stop before update')
@@ -363,45 +451,56 @@ def main():
     raw.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
-    before = measure_all('before')
+    before = measure_all('before', reference['before'] if reference is not None else None)
     check_frozen()
     report = train_once(model, batches[:8], accelerator, optimizer, check_frozen,
-                        [r['two_pass'] for r in before[:8]])
+                        [r['two_pass'] for r in before[:8]], link_only=args.link_only)
     write_json(output / 'update.json', report)
     changed = [n for n, p in raw.named_parameters() if n in initial and not torch.equal(p.detach().cpu(), initial[n])]
-    if not any(n.startswith('backbone.') for n in changed) or not any(n.startswith('hybridlink.') for n in changed):
-        raise RuntimeError('LoRA or Link did not change')
+    if (not any(n.startswith('hybridlink.') for n in changed) or
+            (not args.link_only and not any(n.startswith('backbone.') for n in changed))):
+        raise RuntimeError('expected trainable modules did not change')
     del initial, optimizer
     # Preserve the single update even if a later measurement/replay fails.
     # A checkpoint alone is not a completed run: summary.json is written last.
     check_frozen()
     checkpoint = output / 'checkpoint'
     raw.save_pretrained(checkpoint, tokenizer)
-    write_json(checkpoint / 'train_args.json', {'stage': SELF_CONDITIONED, 'lora_self_conditioned': True,
+    write_json(checkpoint / 'train_args.json', {'stage': SELF_CONDITIONED, 'lora_self_conditioned': not args.link_only,
+               'link_only_self_conditioned': args.link_only,
                'max_steps': 1, 'grad_accum': 8, 'batch_size': 1, 'lr': LR, 'hybridlink_lr': LR, 'source': str(source)})
     write_json(checkpoint / 'link_calibration.json', calibration)
     check_reference_config(checkpoint, source)
     if json.loads((checkpoint / 'hybridlink_config.json').read_text()) != config:
         raise RuntimeError('saved link config differs')
     after = measure_all('after')
+    if args.link_only and any(a[mode] != b[mode] for a, b in zip(before, after)
+                              for mode in ('plain', 'format')):
+        raise RuntimeError('frozen text-only generation changed; preserve the saved update')
     check_frozen()
-    reload_adapters(raw, checkpoint)
+    reload_adapters(raw, checkpoint, link_only=args.link_only)
     # PEFT reload copies frozen anchor deltas too. Their versions legitimately
     # increment; verify exact anchor values before refreshing ONLY those versions.
     check_frozen(check_versions=False)
     for n, param in raw.named_parameters():
-        if n in anchors:
+        if n in anchors and not args.link_only:
             frozen[n] = param._version
     check_frozen()
-    reloaded = measure_all('reloaded')
+    reloaded = measure_all('reloaded', after)
     if after != reloaded:
         raise RuntimeError('saved LoRA+Link replay differs; preserve all reports')
     check_frozen()
-    if file_hashes(source) != hashes or sha256(data) != TRAIN_SHA256:
+    if (file_hashes(source) != hashes or sha256(data) != TRAIN_SHA256
+            or sha256(args.calibration) != calibration['source_calibration_sha256']
+            or any(file_hashes(k) != v for k, v in protected.items())):
         raise RuntimeError('source checkpoint or training data changed')
     torch.cuda.synchronize()
     summary = {
-        'optimizer_steps': 1, 'learning_rate_lora': LR, 'learning_rate_link': LR,
+        'optimizer_steps': 1, 'learning_rate_lora': None if args.link_only else LR, 'learning_rate_link': LR,
+        'link_only': args.link_only, 'trainable_parameters': expected_parameters,
+        'original_16_controls_exact': True if args.link_only else None,
+        'frozen_lora_values_unchanged': True if args.link_only else None,
+        'protected_files_unchanged': True,
         'changed_tensors': changed, 'anchors_values_unchanged': True,
         'frozen_original_weights_no_grad_versions_unchanged': True,
         'saved_lora_link_replay_exact': True, 'source_hashes_unchanged': True,
@@ -416,8 +515,19 @@ def main():
                    'Two-pass loss and six-input predictions do not establish autonomous reasoning. '
                    'Hybrid success is a behavioral score, not proof the vector span completed calculation. '
                    'Frozen original weights checked by versions/no gradients, not full bytewise comparison. '
-                   'Reload swaps saved LoRA/Link in one backbone, not a second base-model load.',
+                   'Reload uses one backbone, not a second base-model load; the Link-only control '
+                   'checks frozen PEFT values without copying them back.',
     }
+    if reference is not None:
+        summary['joint_vs_link_only'] = {
+            'update': compare_records(update, reference['after'][:8], after[:8]),
+            'observation': compare_records(observe, reference['after'][8:], after[8:]),
+            'before_label': 'joint_after', 'after_label': 'link_only_after',
+            'joint_clip_norm': reference['report']['total_norm_before_clip'],
+            'link_only_clip_norm': report['total_norm_before_clip'],
+            'warning': 'Same clip limit, different parameter sets; not equal Link displacement. '
+                       'This is a single-update comparison, not isolated LoRA causality.',
+        }
     write_json(output / 'summary.json', summary)
     # Full per-position and raw generation evidence stays in JSONL/summary.
     for group in ('update', 'observation'):
@@ -430,7 +540,18 @@ def main():
                                r['after']['predicted_ids'], r['before']['target_ids']))]
             print(group, path, json.dumps({**{k: v for k, v in result.items() if k != 'rows'},
                                           'regressions': regressions}, ensure_ascii=False), flush=True)
-    print(json.dumps({k: v for k, v in summary.items() if k not in ('update', 'observation', 'changed_tensors')},
+    if reference is not None:
+        for group in ('update', 'observation'):
+            paired = summary['joint_vs_link_only'][group]
+            print('joint_after_vs_link_only_after', group,
+                  json.dumps({k: v for k, v in paired.items() if k not in ('full', 'cached', 'rows')},
+                             ensure_ascii=False), flush=True)
+            for path in ('full', 'cached'):
+                print('joint_after_vs_link_only_after', group, path,
+                      json.dumps({k: v for k, v in paired[path].items() if k != 'rows'},
+                                 ensure_ascii=False), flush=True)
+    print(json.dumps({k: v for k, v in summary.items() if k not in
+                     ('update', 'observation', 'changed_tensors', 'joint_vs_link_only')},
                      ensure_ascii=False, indent=2), flush=True)
 
 
