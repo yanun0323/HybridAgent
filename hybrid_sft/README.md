@@ -218,6 +218,65 @@ measurements. No development or reserved test records are opened. This is a
 single-update matched comparison, not held-out generalization or proof of latent
 reasoning, nor a guarantee of isolated LoRA causality.
 
+## Four saved-weight swaps without training
+
+`scripts/self_conditioned_swap.py` evaluates a fixed 2-by-2 comparison:
+
+| Label | LoRA | Link |
+|---|---|---|
+| A (new) | Original | Joint-updated |
+| B (recorded control) | Original | Link-only-updated |
+| C (recorded joint) | Joint-updated | Joint-updated |
+| D (new) | Joint-updated | Link-only-updated |
+
+After full tests and separate GPU authorization:
+
+```bash
+python -u scripts/self_conditioned_swap.py \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --calibration /content/qwen-link-smoke/link_calibration.json \
+  --joint-run /content/qwen-lora-self-conditioned-joint-8 \
+  --joint-evaluation /content/qwen-lora-self-conditioned-joint-8-evaluation-r2 \
+  --control-run /content/qwen-link-self-conditioned-control-8 \
+  --output-dir /content/qwen-self-conditioned-swap-16
+```
+
+This loads one backbone and swaps only compact LoRA/Link tensors. No backward,
+optimizer, model export, resume, new update or outcome-based combination selection.
+Require the recorded source/joint/Link-only weight hashes, successful prior reports,
+matching plans/versions/calibration/tokenization, and exact reconstructed summaries.
+Output must be fresh and separate from every source directory. Reserved test data
+is not read; the same sixteen previously trained records are split 8/8 as before.
+
+All combinations use the joint experiment's grad-enabled forward flags solely to
+keep the measurement path consistent; no gradients are accumulated. In particular,
+B must exactly reproduce the recorded Link-only results under this common forward
+path. Do not weaken checks if that fails. The sequence is original source, B, C,
+A, A reloaded, D, D reloaded: **all 48 known control records** must pass before either
+new combination. For each installation validate both files before clearing small
+adapters, including hashes, keys, shapes, dtypes, finite values and unchanged anchors.
+Then clear/reload both adapters, verify exact installed values, check original
+backbone versions/no gradients and exact anchor values. Never clear original
+backbone or anchor weights; PEFT may copy identical anchor values during loading.
+A and D must each replay all sixteen records after another disk reload. Text-only
+outputs must exactly match prior outputs for the same LoRA, regardless of Link.
+
+`run.json` records provenance, pair definitions and execution order. Seven JSONL
+files stream all measurements, including partial failed runs. `summary.json`
+contains the four directional comparisons, each with explicit before/after labels:
+A→C and B→D hold Link fixed; A→B and C→D hold LoRA fixed. It also compares each
+combination with the original source. All reports keep per-record two-pass loss,
+six-position full/cached predictions and regressions, natural/forced exits and raw
+generated text. Terminal reports include per-position regressions even when means
+improve. No summary is written until replay and protected-file checks pass.
+
+These are substitutions of particular saved weights, not independent retraining
+or evidence of generalization. Different LoRA effects under the two fixed Links
+suggest dependence on the pairing, not a universal LoRA benefit. Each recursive
+execution path generates its own vectors; this does not isolate cache arithmetic
+using identical supplied vectors. Natural exit and visible recalculation remain
+separate from prediction loss. Preserve every failure; never retry automatically.
+
 ## Evaluate the saved interrupted LoRA + Link update without retraining
 
 The single-update run can stop after saving weights if tokenizer loading metadata
