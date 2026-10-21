@@ -164,6 +164,55 @@ A single-record backward memory result does not guarantee that optimizer state,
 other trajectories and generation all fit. This experiment tests an initial update,
 not generalization or successful autonomous reasoning.
 
+## Evaluate the saved interrupted LoRA + Link update without retraining
+
+The single-update run can stop after saving weights if tokenizer loading metadata
+changes during offline loading. `check_reference_config` now ignores only the
+boolean `is_local` and `local_files_only` fields in `tokenizer_config.json` (also
+allowing those fields to be absent). These describe loading provenance, not
+vocabulary or tokenization. Malformed flag values and every other setting remain
+strictly checked; no checkpoint file is edited.
+
+For the recorded run interrupted before `after.jsonl`, use a **new** output directory:
+
+```bash
+python -u scripts/lora_self_conditioned_evaluate.py \
+  --pilot /content/format-pilot --model /content/qwen-link-64 \
+  --joint-run /content/qwen-lora-self-conditioned-joint-8 \
+  --output-dir /content/qwen-lora-self-conditioned-joint-8-evaluation
+```
+
+This is not a resume command. It contains no backward, optimizer, weight update or
+model export. It is restricted to the recorded original and saved adapter hashes,
+original training file, sixteen fixed IDs, one-update plan, versions, calibration
+and tokenization. It also verifies source/saved tokenizer encodings agree on all
+sixteen trajectories. The existing failed run, checkpoint and data remain read-only;
+all source/run file hashes are checked again at the end. No development/test data
+is opened. Preserve the failed log too; do not overwrite or rerun training.
+
+One backbone is loaded from the original source. All sixteen `before.jsonl` records
+must replay exactly, including scalar losses, six-position metrics and generated
+outputs, before saved adapters can be installed. A mismatch stops immediately and
+retains the partial control report. Saved LoRA and Link must have matching keys,
+shapes and dtypes and finite values; the two anchor tensors must equal the source.
+Only compact adapter tensors are installed, never full backbone weights.
+
+The script reuses the same measurement functions and precision as the interrupted
+experiment. The two-pass forward remains grad-enabled only to reproduce that
+measurement path; graphs are discarded, never backpropagated. After measuring all
+sixteen records with saved weights, it clears only trainable adapter tensors,
+reloads them from disk and repeats all measurements exactly. Original backbone
+versions/no-grad checks and exact anchor values are checked throughout.
+
+`control.jsonl`, `after.jsonl`, `reloaded.jsonl`, `run.json` and `summary.json` are
+written only in the new evaluation folder. Summary retains per-record/per-position
+regressions and generation transitions separately for update/observation groups.
+`optimizer_steps_this_run` is zero, `original_optimizer_steps` is one. Successful
+saved-adapter replay now is not evidence of matching the former live post-update
+model, whose metrics were never measured. Reported GPU memory/time belong to this
+evaluation, not the interrupted training. Existing outputs are rejected; GPU
+execution still requires separate authorization after all tests pass without skips.
+
 ## Experimental single-GPU LoRA format activation
 
 This is a resource-saving adaptation, not a reproduction of full-parameter
