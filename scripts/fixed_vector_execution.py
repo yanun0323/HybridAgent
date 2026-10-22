@@ -63,8 +63,8 @@ def verify_swap(path, protected, plan, ids, reference, control):
     return rows['A']
 
 
-def fixed_rollout(model, sample, entry_id, exit_id, vectors, path):
-    """Feed six supplied FP32 vectors, cast once to embedding dtype. Never call Link.
+def fixed_rollout(model, sample, entry_id, exit_id, vectors, path, *, steps=6):
+    """Feed three/six supplied FP32 vectors, cast to embedding dtype. Never call Link.
 
     Reproduce the respective recursive path's prefix segmentation and positions.
     Capture entry and post-input hidden states/logits; labels never become inputs.
@@ -72,19 +72,21 @@ def fixed_rollout(model, sample, entry_id, exit_id, vectors, path):
     import torch
     import torch.nn.functional as F
     from hybrid_agent.compat import text_decoder
+    if steps not in (3, 6):
+        raise ValueError('steps must be three or six')
     if path not in ('full', 'cached'):
         raise ValueError('path must be full or cached')
     if torch.is_grad_enabled() or any(p.requires_grad for p in model.parameters()) or any(m.training for m in model.modules()):
         raise ValueError('requires frozen eval mode and no_grad')
     start, end = span_bounds(sample, entry_id, exit_id)
     ids, prompt_len = sample['input_ids'], sample['prompt_len']
-    if end - start - 1 < 6 or not 0 < prompt_len <= start:
-        raise ValueError('requires prompt, entry and six content tokens')
+    if end - start - 1 < steps or not 0 < prompt_len <= start:
+        raise ValueError(f'requires prompt, entry and {steps} content tokens')
     embed = model.backbone.get_input_embeddings()
     device, dtype = embed.weight.device, embed.weight.dtype
-    if len(vectors) != 6 or any(v.shape != (1, 1, embed.weight.shape[1]) or
+    if len(vectors) != steps or any(v.shape != (1, 1, embed.weight.shape[1]) or
             v.dtype != torch.float32 or not torch.isfinite(v).all() for v in vectors):
-        raise ValueError('requires six finite FP32 vectors of matching shape')
+        raise ValueError(f'requires {steps} finite FP32 vectors of matching shape')
     supplied = tuple(v.detach().to(device=device, dtype=dtype).clone() for v in vectors)
     decoder, head = text_decoder(model.backbone), model.backbone.get_output_embeddings()
     prefix = embed(torch.tensor([ids[:start + 1]], device=device)) if path == 'full' else None
@@ -138,9 +140,9 @@ def fixed_rollout(model, sample, entry_id, exit_id, vectors, path):
     return {'loss': losses.mean(), 'step_losses': losses,
             'rollout_vectors': tuple(v.detach().clone() for v in vectors),
             'predicted_ids': torch.stack(predicted, dim=1),
-            'target_ids': torch.tensor([ids[start + 2:start + 8]], device=device),
-            'substitution_positions': list(range(start + 1, start + 7)),
-            'target_positions': list(range(start + 2, start + 8)),
+            'target_ids': torch.tensor([ids[start + 2:start + steps + 2]], device=device),
+            'substitution_positions': list(range(start + 1, start + steps + 1)),
+            'target_positions': list(range(start + 2, start + steps + 2)),
             'hidden': hidden, 'logits': logits, 'fed_vectors': supplied}
 
 
@@ -160,15 +162,16 @@ def tensor_difference(a, b):
 
 def compare_fixed(full, cached, fm, cm):
     import torch
+    steps = len(full['fed_vectors'])
     for out in (full, cached):
-        if len(out['fed_vectors']) != 6 or len(out['hidden']) != 7 or len(out['logits']) != 7:
-            raise ValueError('requires six fixed inputs and seven captured states')
+        if steps not in (3, 6) or len(out['fed_vectors']) != steps or len(out['hidden']) != steps + 1 or len(out['logits']) != steps + 1:
+            raise ValueError('requires three/six fixed inputs and matching captured states')
     for a, b in zip(full['fed_vectors'], cached['fed_vectors']):
         if a.dtype != b.dtype or not torch.equal(a, b):
             raise RuntimeError('fixed inputs differ after casting')
     report = compare_paths(fm, cm, full['rollout_vectors'], cached['rollout_vectors'])
     states = []
-    for step in range(7):
+    for step in range(steps + 1):
         states.append({'step': step, 'hidden': tensor_difference(full['hidden'][step], cached['hidden'][step]),
                        'logits': tensor_difference(full['logits'][step], cached['logits'][step]),
                        'full_argmax': full['logits'][step].argmax(-1).item(),
@@ -209,6 +212,7 @@ def main():
     for name in ('pilot', 'model', 'calibration', 'joint-run', 'joint-evaluation',
                  'control-run', 'swap-run', 'output-dir'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--third-vector-from', help='Completed fixed-vector run; only 72*2-4, four three-input combinations')
     args = parser.parse_args()
     source, pilot, joint, evaluation, control, swap, output = [Path(v).resolve() for v in
         (args.model, args.pilot, args.joint_run, args.joint_evaluation, args.control_run,
@@ -226,6 +230,13 @@ def main():
     plan = reference['run']
     expected = verify_swap(swap, protected, plan, [r['id'] for r in rows], reference, control_rows)
     protected[swap] = file_hashes(swap)
+    third_reference = None
+    if args.third_vector_from:
+        from third_vector_swap import verify_fixed_run, run_third_swap, CASE_ID
+        fixed_source = Path(args.third_vector_from).resolve()
+        validate_paths(source, fixed_source, output)
+        third_reference = verify_fixed_run(fixed_source, protected, plan, expected)
+        protected[fixed_source] = file_hashes(fixed_source)
     checkpoints = {'source': source, 'joint': joint / 'checkpoint', 'control': control / 'checkpoint'}
     for label, lora_hash, link_hash in (
             ('source', SOURCE_LORA_SHA256, SOURCE_LINK_SHA256),
@@ -268,15 +279,23 @@ def main():
     require_replay(hashes, plan['tokenization_sha256'], 'tokenization')
     batches = [{k: v.to(accelerator.device) for k, v in collate_batch(tokenizer, [s], pad_to_multiple=1).items()}
                for s in samples]
+    if third_reference is not None:
+        selected = next(i for i, r in enumerate(rows) if r['id'] == CASE_ID)
+        rows, samples, batches = [rows[selected]], [samples[selected]], [batches[selected]]
+        hashes = [hashes[selected]]
     output.mkdir(parents=True)
     write_json(output / 'run.json', {
-        'pair': 'A', 'sample_ids': [r['id'] for r in rows], 'groups': {'update': 8, 'observation': 8},
+        'pair': 'A', 'sample_ids': [r['id'] for r in rows], 'groups': {'update': 0, 'observation': 1} if third_reference else {'update': 8, 'observation': 8},
+        'third_vector_from': str(fixed_source) if third_reference else None,
+        'three_input_combinations': [['full', 'full'], ['cached', 'cached'],
+                                     ['full', 'cached'], ['cached', 'full']] if third_reference else None,
         'protected_hashes': {str(p): h for p, h in protected.items()},
         'calibration': calibration, 'tokenization_sha256': hashes, 'seed': plan['seed'],
-        'optimizer_steps': 0, 'weights_saved': False, 'vectors_saved': True,
+        'optimizer_steps': 0, 'weights_saved': False, 'vectors_saved': third_reference is None,
         'precision': 'eval/no_grad; BF16 autocast, FP32 Link; fixed inputs cast to embedding dtype',
         'donors': ['full', 'cached'], 'paths': ['full', 'cached'],
-        'step_numbering': '0 = entry output; 1..6 = outputs after fixed vectors',
+        'step_numbering': '0 = entry output; 1..3 = interventions, 1..6 = historical controls' if third_reference
+                          else '0 = entry output; 1..6 = outputs after fixed vectors',
         'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'script_sha256': sha256(Path(__file__)), **versions,
     })
@@ -301,53 +320,56 @@ def main():
     indexes = {r['id']: i for i, r in enumerate(rows)}
     results = []
     with frozen_evaluation(raw), torch.no_grad(), accelerator.autocast():
-        def measure(row):
-            i = indexes[row['id']]
-            metrics, vectors = {}, {}
-            out = raw(**batches[i], stage=LINK_NEXT_TOKEN, link_steps=6)
-            metrics['full'], vectors['full'] = measurements(out, tokenizer)
-            del out
-            out = cached_rollout(raw, samples[i], entry, exit, link_steps=6)
-            metrics['cached'], vectors['cached'] = measurements(out, tokenizer)
-            return metrics, vectors
-        with (output / 'controls.jsonl').open('x') as stream:
-            def record(item):
-                stream.write(json.dumps(item) + '\n')
-                stream.flush()
-                print('control exact:', item['id'], flush=True)
-            controls = collect_controls(rows, expected, measure, record)
-        with (output / 'measurements.jsonl').open('x') as stream:
-            for i, (row, (metrics, vectors)) in enumerate(zip(rows, controls)):
-                item = {'id': row['id'], 'question': row['question'],
-                        'group': 'update' if i < 8 else 'observation',
-                        'recursive': metrics, 'recursive_comparison': compare_paths(
-                            metrics['full'], metrics['cached'], vectors['full'], vectors['cached']), 'fixed': {}}
-                vector_path = output / f'vectors-{row["id"]}.pt'
-                with vector_path.open('xb') as f:
-                    torch.save(vectors, f)
-                saved = torch.load(vector_path, map_location='cpu', weights_only=True)
-                for donor in ('full', 'cached'):
-                    if len(saved[donor]) != 6 or any(a.dtype != b.dtype or not torch.equal(a, b)
-                            for a, b in zip(vectors[donor], saved[donor])):
-                        raise RuntimeError('saved vectors differ')
-                    outputs, measures = {}, {}
-                    for path in ('full', 'cached'):
-                        out = fixed_rollout(raw, samples[i], entry, exit, saved[donor], path)
-                        repeated = fixed_rollout(raw, samples[i], entry, exit, saved[donor], path)
-                        require_fixed_repeat(out, repeated, tokenizer)
-                        del repeated
-                        measures[path], _ = measurements(out, tokenizer)
-                        if path == donor:
-                            require_replay(measures[path], metrics[path], f'{row["id"]}/{donor} self replay')
-                        outputs[path] = out
-                    item['fixed'][donor] = {'metrics': measures, 'comparison': compare_fixed(
-                        outputs['full'], outputs['cached'], measures['full'], measures['cached'])}
-                    del outputs, out
-                item['vectors_sha256'] = sha256(vector_path)
-                results.append(item)
-                stream.write(json.dumps(item, ensure_ascii=False) + '\n')
-                stream.flush()
-                print(row['id'], json.dumps({k: v['comparison'] for k, v in item['fixed'].items()}), flush=True)
+        if third_reference is not None:
+            results = run_third_swap(raw, samples[0], entry, exit, tokenizer, third_reference, output)
+        else:
+            def measure(row):
+                i = indexes[row['id']]
+                metrics, vectors = {}, {}
+                out = raw(**batches[i], stage=LINK_NEXT_TOKEN, link_steps=6)
+                metrics['full'], vectors['full'] = measurements(out, tokenizer)
+                del out
+                out = cached_rollout(raw, samples[i], entry, exit, link_steps=6)
+                metrics['cached'], vectors['cached'] = measurements(out, tokenizer)
+                return metrics, vectors
+            with (output / 'controls.jsonl').open('x') as stream:
+                def record(item):
+                    stream.write(json.dumps(item) + '\n')
+                    stream.flush()
+                    print('control exact:', item['id'], flush=True)
+                controls = collect_controls(rows, expected, measure, record)
+            with (output / 'measurements.jsonl').open('x') as stream:
+                for i, (row, (metrics, vectors)) in enumerate(zip(rows, controls)):
+                    item = {'id': row['id'], 'question': row['question'],
+                            'group': 'update' if i < 8 else 'observation',
+                            'recursive': metrics, 'recursive_comparison': compare_paths(
+                                metrics['full'], metrics['cached'], vectors['full'], vectors['cached']), 'fixed': {}}
+                    vector_path = output / f'vectors-{row["id"]}.pt'
+                    with vector_path.open('xb') as f:
+                        torch.save(vectors, f)
+                    saved = torch.load(vector_path, map_location='cpu', weights_only=True)
+                    for donor in ('full', 'cached'):
+                        if len(saved[donor]) != 6 or any(a.dtype != b.dtype or not torch.equal(a, b)
+                                for a, b in zip(vectors[donor], saved[donor])):
+                            raise RuntimeError('saved vectors differ')
+                        outputs, measures = {}, {}
+                        for path in ('full', 'cached'):
+                            out = fixed_rollout(raw, samples[i], entry, exit, saved[donor], path)
+                            repeated = fixed_rollout(raw, samples[i], entry, exit, saved[donor], path)
+                            require_fixed_repeat(out, repeated, tokenizer)
+                            del repeated
+                            measures[path], _ = measurements(out, tokenizer)
+                            if path == donor:
+                                require_replay(measures[path], metrics[path], f'{row["id"]}/{donor} self replay')
+                            outputs[path] = out
+                        item['fixed'][donor] = {'metrics': measures, 'comparison': compare_fixed(
+                            outputs['full'], outputs['cached'], measures['full'], measures['cached'])}
+                        del outputs, out
+                    item['vectors_sha256'] = sha256(vector_path)
+                    results.append(item)
+                    stream.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    stream.flush()
+                    print(row['id'], json.dumps({k: v['comparison'] for k, v in item['fixed'].items()}), flush=True)
     if any(p.grad is not None or p._version != versions_before[n] for n, p in raw.named_parameters()):
         raise RuntimeError('parameters changed or gradients accumulated')
     if any(not torch.equal(p.detach().cpu(), anchors[n]) for n, p in raw.named_parameters() if n in anchors):
@@ -365,6 +387,14 @@ def main():
                'warning': 'Training records only, pair A only. No generation or exit evaluation repeated. '
                           'Fixed-path differences include prefix segmentation and numerical execution; '
                           'they do not alone identify a cache bug or prove latent reasoning.'}
+    if third_reference is not None:
+        summary.update(count=1, results=results, vectors_saved=False,
+                       historical_four_six_step_controls_exact=True,
+                       truncated_controls_exact=True, history_states_unchanged=True,
+                       warning='Single previously trained case 72*2-4, pair A. Fixed first-two history x third vector. '
+                               'No fourth input, recursive continuation, generation or natural-exit evaluation.')
+        del summary['historical_32_path_controls_exact']
+        del summary['fixed_self_replay_exact']
     write_json(output / 'summary.json', summary)
     print(json.dumps({k: v for k, v in summary.items() if k != 'results'}, indent=2), flush=True)
 

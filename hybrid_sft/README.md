@@ -256,6 +256,42 @@ with fixed inputs narrow the question to execution (including prefix segmentatio
 and precision); they do not alone establish a cache bug, generalization, natural
 exit or complete latent reasoning.
 
+### Third-vector intervention on 72*2-4 (requires separate GPU approval)
+
+The same CLI accepts `--third-vector-from /content/qwen-fixed-vector-A-16`,
+in addition to all existing arguments and a fresh `--output-dir`. This selects
+only `mul-sub-72-2-4`, pair A; it never regenerates vectors. Source run/summary,
+ordered controls, code version, calibration, tokenization, protected files and
+saved-vector hashes must match the completed `abf88ad` fixed-vector experiment.
+All sixteen tokenizations are checked before selecting the one fixed case.
+
+First replay the two saved six-vector donors on both execution paths, including
+recorded metrics and hidden/logit comparison reports. All four historical controls
+must match exactly before the intervention. Then evaluate these fixed combinations:
+
+| First two vectors | Third vector |
+|---|---|
+| full donor | full donor |
+| cached donor | cached donor |
+| full donor | cached donor |
+| cached donor | full donor |
+
+Each combination runs on full-prefix and cached execution with fresh state and
+exact repeated hidden states/logits/metrics. The unmixed three-input controls
+must exactly reproduce the first three positions of the six-input controls.
+Changing the third vector must leave states 0–2 unchanged. No fourth vector is
+fed in the intervention, no Link is called, and no recursive continuation,
+training, generation, exit evaluation or weight/vector export is performed.
+The original six-input diagnostic remains the default without this option.
+
+`third-vector.jsonl` streams historical controls followed by the four combinations.
+`summary.json` keeps all three per-position metrics, cross-execution comparisons,
+conditional third-input and history effects, and the difference between the two
+third-input CE effects (an interaction on the CE scale, not a statistical test).
+Failures stop without relaxing comparisons or automatic retries. This isolates
+conditional substitutions in one previously trained case; it does not establish
+which individual earlier vector matters, why execution differs, or generalization.
+
 ## Four saved-weight swaps without training
 
 `scripts/self_conditioned_swap.py` evaluates a fixed 2-by-2 comparison:
